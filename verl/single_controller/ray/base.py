@@ -119,6 +119,7 @@ class RayResourcePool(ResourcePool):
         max_colocate_count: int = 10,
         detached=False,
         accelerator_type: Optional[str] = None,
+        node_ip: Optional[str] = None,
     ) -> None:
         super().__init__(process_on_nodes, max_colocate_count)
         self.use_gpu = use_gpu
@@ -127,6 +128,7 @@ class RayResourcePool(ResourcePool):
         self.pgs = None
         self.detached = detached
         self.accelerator_type = accelerator_type
+        self.node_ip = node_ip
 
     def get_placement_groups(self, strategy="STRICT_PACK", name=None, device_name="cuda"):
         if self.pgs is not None:
@@ -148,6 +150,10 @@ class RayResourcePool(ResourcePool):
             bundle[device_name] = 1
             if self.accelerator_type is not None:
                 bundle[self.accelerator_type] = 1e-4
+        if self.node_ip is not None:
+            # Ray advertises a `node:<ip>` resource on every node; requesting a sliver of
+            # it pins the placement group to that host without consuming anything real.
+            bundle[f"node:{self.node_ip}"] = 0.001
         pg_scheme = [[bundle.copy() for _ in range(process_count)] for process_count in self._store]
 
         lifetime = "detached" if self.detached else None
@@ -191,6 +197,8 @@ class ResourcePoolManager:
     mapping: dict[int, str]
     max_colocate_count: int = 3
     resource_pool_dict: dict[str, RayResourcePool] = field(default_factory=dict)
+    use_gpu: bool = True
+    node_ip: Optional[str] = None
 
     def create_resource_pool(self):
         """Create Ray resource pools for distributed training.
@@ -207,9 +215,10 @@ class ResourcePoolManager:
             # that can utilize different WorkerGroup for differnt models
             resource_pool = RayResourcePool(
                 process_on_nodes=process_on_nodes,
-                use_gpu=True,
+                use_gpu=self.use_gpu,
                 max_colocate_count=self.max_colocate_count,
                 name_prefix=resource_pool_name,
+                node_ip=self.node_ip,
             )
             self.resource_pool_dict[resource_pool_name] = resource_pool
 
@@ -225,10 +234,16 @@ class ResourcePoolManager:
 
     def _check_resource_available(self):
         """Check if the resource pool can be satisfied in this ray cluster."""
+        if not self.use_gpu:
+            # These pools intentionally request no accelerator, so there is nothing to check.
+            return
+
+        # Accelerators are exposed under a platform-specific Ray resource name
+        # ("GPU" for CUDA/ROCm, "NPU" for Ascend, "TPU" for Cloud TPU, ...).
+        resource_name = get_platform().ray_resource_name()
         node_available_resources = ray._private.state.available_resources_per_node()
         node_available_gpus = {
-            node: node_info.get("GPU", 0) if "GPU" in node_info else node_info.get("NPU", 0)
-            for node, node_info in node_available_resources.items()
+            node: node_info.get(resource_name, 0) for node, node_info in node_available_resources.items()
         }
 
         # check total required gpus can be satisfied
@@ -238,7 +253,8 @@ class ResourcePoolManager:
         )
         if total_available_gpus < total_required_gpus:
             raise ValueError(
-                f"Total available GPUs {total_available_gpus} is less than total desired GPUs {total_required_gpus}"
+                f"Total available {resource_name}s {total_available_gpus} is less than "
+                f"total desired {resource_name}s {total_required_gpus}"
             )
 
 

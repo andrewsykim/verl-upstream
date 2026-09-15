@@ -27,7 +27,7 @@ from typing import Any, Literal, Optional, get_args
 import torch
 from vllm.outputs import RequestOutput
 
-from verl.utils.device import get_device_name, is_npu_available
+from verl.utils.device import get_device, get_device_name, is_npu_available
 from verl.utils.vllm import TensorLoRARequest, VLLMHijack, resolve_weight_name
 from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
 from verl.utils.vllm.vllm_quant_utils import apply_vllm_quant_patches, is_fp8_model, load_quanted_weights
@@ -68,6 +68,27 @@ def _resolve_vllm_weight_sync_local_rank(worker_local_rank: int, parallel_config
 
     tp_rank = worker_local_rank % tp_size
     return int(dp_local_rank) * tp_size + tp_rank
+
+
+def _unflip_tpu_weights(model: torch.nn.Module) -> None:
+    """Un-flip TPU dense linear weights back to standard vLLM layout.
+
+    On TPU, VllmUnquantizedLinearMethod transposes dense linear weights to
+    [n_in, n_out] and replaces the parameter with a plain Parameter, stripping
+    output_dim, input_dim, and weight_loader attributes. Before calling
+    model.load_weights(), we restore weights to [n_out, n_in] and reinstate
+    those attributes so that vLLM's sharded load_weights functions correctly.
+    process_weights_after_loading will re-transpose them afterwards.
+    """
+    for mod in model.modules():
+        if getattr(mod, "_tpu_weight_flipped", False):
+            if hasattr(mod, "weight") and mod.weight is not None:
+                mod.weight.data = mod.weight.data.transpose(0, 1).contiguous()
+                mod.weight.output_dim = 0
+                mod.weight.input_dim = 1
+                if hasattr(mod, "weight_loader") and callable(mod.weight_loader):
+                    mod.weight.weight_loader = mod.weight_loader
+            mod._tpu_weight_flipped = False
 
 
 def set_death_signal():
@@ -238,14 +259,27 @@ class vLLMColocateWorkerExtension:
             # patch weight loader to support MoE model
             patch_vllm_moe_model_weight_loader(model)
 
-    def update_weights_from_ipc(self, peft_config: dict = None, base_sync_done=False, use_shm: bool = False):
+    def update_weights_from_ipc(
+        self,
+        peft_config: dict = None,
+        base_sync_done=False,
+        use_shm: bool = False,
+        use_socket: bool = False,
+        sender_ip: str = None,
+        base_port: int = 28000,
+    ):
         """Update the weights of the rollout model."""
         from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import BucketedWeightReceiver
 
-        if self.device is None:
-            # vLLM workers may leave self.device unset on non-CUDA platforms (e.g. NPU);
-            # fall back to the worker's local rank on the current accelerator.
-            self.device = torch.device(f"{get_device_name()}:{self.local_rank}")
+        worker_device = getattr(self, "device", None)
+        if worker_device is None:
+            # vLLM workers may leave self.device unset on non-CUDA platforms (e.g. NPU,
+            # TPU); fall back to the worker's local rank on the current accelerator.
+            # Platforms that bind one device per process ignore the index.
+            local_rank = getattr(self, "local_rank", getattr(self, "rank", 0))
+            worker_device = get_device(local_rank)
+            if hasattr(self, "device"):
+                self.device = worker_device
 
         # =========================== step 1: prepare for weight loading ===========================
         quant_reload_states = None
@@ -264,12 +298,12 @@ class vLLMColocateWorkerExtension:
             from verl.utils.qat import prepare_qat_for_load_weights
 
             for model in self._iter_all_models():
-                prepare_qat_for_load_weights(model, device=self.device)
+                prepare_qat_for_load_weights(model, device=worker_device)
             logger.info("QAT: prepare_qat_for_load_weights completed")
         elif self._is_modelopt_qat:
             from verl.utils.modelopt.vllm_modelopt_patch import prepare_modelopt_for_weight_reload
 
-            prepare_modelopt_for_weight_reload(self.model_runner.model, device=self.device)
+            prepare_modelopt_for_weight_reload(self.model_runner.model, device=worker_device)
             logger.info("ModelOpt: prepare_modelopt_for_weight_reload completed")
         elif peft_config and base_sync_done:
             # Remove the old LoRA before the new one arrives (applied after is_last below).
@@ -285,12 +319,24 @@ class vLLMColocateWorkerExtension:
             # TODO(wuxibin): not need anymore for newer vllm version.
             for model in self._iter_all_models():
                 patch_vllm_moe_model_weight_loader(model)
+                _unflip_tpu_weights(model)
 
         # =========================== step 2: receive weights and update ===========================
+        if use_socket:
+            vllm_config = getattr(self.model_runner, "vllm_config", None)
+            parallel_config = getattr(vllm_config, "parallel_config", None)
+            local_rank = _resolve_vllm_weight_sync_local_rank(
+                getattr(self, "local_rank", getattr(self, "rank", 0)), parallel_config
+            )
+            zmq_handle = f"tcp://{sender_ip}:{base_port + local_rank}"
+        else:
+            zmq_handle = self._get_zmq_handle()
+
         receiver = BucketedWeightReceiver(
-            zmq_handle=self._get_zmq_handle(),
-            device=self.device,
+            zmq_handle=zmq_handle,
+            device=worker_device,
             use_shm=use_shm,
+            use_socket=use_socket,
         )
         # LoRA adapters need a single complete tensor dict per ``add_lora``, but
         # the bucketed transport may split one across buckets. Accumulate and
@@ -343,7 +389,7 @@ class vLLMColocateWorkerExtension:
             from vllm.model_executor.model_loader.utils import process_weights_after_loading
 
             for model, model_config in self._iter_all_models_with_config():
-                process_weights_after_loading(model, model_config, self.device)
+                process_weights_after_loading(model, model_config, worker_device)
 
     def _apply_buffer_updates_all_models(self, buffer_updates, main_named_buffers):
         """Apply buffer updates to the main model and any synced MTP drafter.
@@ -394,6 +440,7 @@ class vLLMColocateWorkerExtension:
             else:
                 if param_updates:
                     for model in self._iter_all_models():
+                        _unflip_tpu_weights(model)
                         if peft_config is None:
                             model.load_weights(param_updates)
                         else:
@@ -418,7 +465,9 @@ class vLLMColocateWorkerExtension:
         job_id = os.environ.get("VERL_RAY_JOB_ID", "0")
         vllm_config = getattr(self.model_runner, "vllm_config", None)
         parallel_config = getattr(vllm_config, "parallel_config", None)
-        local_rank = _resolve_vllm_weight_sync_local_rank(self.local_rank, parallel_config)
+        local_rank = _resolve_vllm_weight_sync_local_rank(
+            getattr(self, "local_rank", getattr(self, "rank", 0)), parallel_config
+        )
         trainer_rank_base = os.environ.get("VERL_ZMQ_BASE_TRAINER_RANK")
         trainer_rank = int(trainer_rank_base) + local_rank if trainer_rank_base is not None else local_rank
         return f"ipc:///tmp/rl-colocate-zmq-{job_id}-replica-{replica_rank}-rank-{trainer_rank}.sock"

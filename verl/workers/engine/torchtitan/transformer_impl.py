@@ -33,7 +33,6 @@ from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.optimizer import OptimizersContainer, ParamGroupConfig
 from torchtitan.config import CompileConfig, ParallelismConfig, TrainingConfig
 from torchtitan.distributed import utils as dist_utils
-from torchtitan.distributed.activation_checkpoint import FullAC, SelectiveAC
 from torchtitan.distributed.context_parallel import prepare_context_parallel_input
 from torchtitan.distributed.parallel_dims import ParallelDims
 from torchtitan.train import Trainer
@@ -43,7 +42,7 @@ from verl.trainer.config import CheckpointConfig
 from verl.utils import tensordict_utils as tu
 from verl.utils.dataset.dataset_utils import DatasetPadMode
 from verl.utils.debug import log_gpu_memory_usage
-from verl.utils.device import get_device_id, get_device_name
+from verl.utils.device import get_device, get_device_name
 from verl.utils.fsdp_utils import (
     load_fsdp_model_to_gpu,
     load_fsdp_optimizer,
@@ -53,6 +52,12 @@ from verl.utils.fsdp_utils import (
 from verl.utils.model import extract_multi_modal_inputs
 from verl.utils.torch_functional import logprobs_from_logits
 from verl.workers.config import HFModelConfig, TorchtitanEngineConfig, TorchtitanOptimizerConfig
+from verl.workers.engine.torchtitan.compat import (
+    build_activation_checkpoint_config,
+    build_lr_scheduler_config,
+    build_optimizer_config,
+    build_parallelism_config,
+)
 from verl.workers.engine.torchtitan.utils import (
     NoOpDataLoader,
     derive_torchtitan_name_and_flavor,
@@ -134,19 +139,16 @@ class TorchTitanEngine(BaseEngine):
         model_module = importlib.import_module(f"torchtitan.models.{torchtitan_name}")
         model_spec = model_module.model_registry(torchtitan_flavor, attn_backend=self.engine_config.attn_type)
 
-        optimizer = OptimizersContainer.Config(
-            param_groups=[
-                ParamGroupConfig(
-                    pattern=r".*",
-                    optimizer_name=self.optimizer_config.name,
-                    optimizer_kwargs={
-                        "lr": self.optimizer_config.lr,
-                        "eps": self.optimizer_config.eps,
-                        "betas": (self.optimizer_config.betas[0], self.optimizer_config.betas[1]),
-                        "weight_decay": self.optimizer_config.weight_decay,
-                    },
-                )
-            ],
+        optimizer = build_optimizer_config(
+            OptimizersContainer,
+            ParamGroupConfig,
+            name=self.optimizer_config.name,
+            optimizer_kwargs={
+                "lr": self.optimizer_config.lr,
+                "eps": self.optimizer_config.eps,
+                "betas": (self.optimizer_config.betas[0], self.optimizer_config.betas[1]),
+                "weight_decay": self.optimizer_config.weight_decay,
+            },
         )
 
         total_steps = self.optimizer_config.total_training_steps
@@ -154,12 +156,14 @@ class TorchTitanEngine(BaseEngine):
         if lr_warmup_steps is None or lr_warmup_steps <= 0:
             lr_warmup_steps = int(self.optimizer_config.lr_warmup_steps_ratio * total_steps)
 
-        lr_scheduler = LRSchedulersContainer.Config(
+        lr_scheduler = build_lr_scheduler_config(
+            LRSchedulersContainer,
             warmup_steps=lr_warmup_steps,
             decay_type=self.optimizer_config.decay_type,
             min_lr_factor=self.optimizer_config.min_lr_factor,
         )
-        parallelism = ParallelismConfig(
+        parallelism = build_parallelism_config(
+            ParallelismConfig,
             data_parallel_replicate_degree=self.engine_config.data_parallel_replicate_size,
             data_parallel_shard_degree=self.engine_config.data_parallel_shard_size,
             fsdp_reshard_after_forward=self.engine_config.reshard_after_forward,
@@ -189,11 +193,7 @@ class TorchTitanEngine(BaseEngine):
         # on the autograd backward thread where the thread-local SPMD mesh is inactive,
         # so spmd.assert_type() raises "no current mesh". Set activation_checkpoint="none"
         # (or enable torch.compile, which recomputes in-graph) in that configuration.
-        activation_checkpoint = {
-            "selective": SelectiveAC.Config,
-            "full": FullAC.Config,
-            "none": lambda: None,
-        }[self.engine_config.activation_checkpoint]()
+        activation_checkpoint = build_activation_checkpoint_config(self.engine_config.activation_checkpoint)
 
         # Construct Torchtitan's Trainer.Config
         self.config = Trainer.Config(
@@ -363,7 +363,7 @@ class TorchTitanEngine(BaseEngine):
         tu.assign_non_tensor(data, sp_size=self.engine_config.tensor_parallel_size)
 
         # Compute num_tokens in global batch for loss normalization
-        batch_num_tokens = data["loss_mask"].sum().to(get_device_id())
+        batch_num_tokens = data["loss_mask"].sum().to(get_device())
         dp_group = self.get_data_parallel_group()
         if dp_group is not None:
             torch.distributed.all_reduce(batch_num_tokens, op=torch.distributed.ReduceOp.SUM, group=dp_group)
@@ -607,7 +607,7 @@ class TorchTitanEngine(BaseEngine):
             if slots is not None:
                 stacks[name] = slots
         params = self._to_hf_named_params({k: v for k, v in raw.items() if k not in stacks})
-        device = get_device_id()  # local shards live on CPU under an offload policy
+        device = get_device()  # local shards live on CPU under an offload policy
 
         from ..spec import ShardSpec
 
@@ -653,7 +653,7 @@ class TorchTitanEngine(BaseEngine):
         dense = self._to_hf_named_params({k: v for k, v in params.items() if k not in stacks})
         params.clear()
 
-        device = get_device_id()  # used when fsdp2 set cpu_offload_policy
+        device = get_device()  # used when fsdp2 set cpu_offload_policy
 
         def _gen():
             # TODO: cast fp32 to bf16 to reduce weight sync overhead, need more fine-grained control, e.g MoE gate
@@ -714,7 +714,7 @@ class EngineTrainModeCtx(BaseEngineCtx):
         super().__exit__(exc_type, exc_value, traceback)
 
 
-@EngineRegistry.register(model_type="language_model", backend=["torchtitan"], device=["cuda", "npu"])
+@EngineRegistry.register(model_type="language_model", backend=["torchtitan"], device=["cuda", "npu", "tpu"])
 class TorchTitanEngineWithLMHead(TorchTitanEngine):
     """TorchTitan engine implementation for language models with LM head."""
 
@@ -746,7 +746,11 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
             loss_mask = micro_batch["loss_mask"]
             pad_token_id = tu.get_non_tensor_data(data=micro_batch, key="pad_token_id", default=0)
             batch_size = micro_batch.batch_size[0]
-            max_seq_len = max(input_ids.offsets().diff())
+            batch_max_len = int(max(input_ids.offsets().diff()))
+            if self.engine_config.max_seq_len is not None:
+                max_seq_len = max(self.engine_config.max_seq_len, batch_max_len)
+            else:
+                max_seq_len = batch_max_len
 
             labels = torch.roll(input_ids.values(), shifts=-1, dims=0)
             input_ids = torch.nested.to_padded_tensor(
@@ -859,7 +863,7 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
 
     def forward_step(self, micro_batch: TensorDict, loss_function, forward_only):
         device_name = get_device_name()
-        micro_batch = micro_batch.to(get_device_id())
+        micro_batch = micro_batch.to(get_device())
         input_ids, extra_inputs, extra_kwargs, output_args = self.prepare_model_inputs(micro_batch=micro_batch)
 
         with torch.autocast(device_type=device_name, dtype=torch.bfloat16):

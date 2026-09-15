@@ -20,6 +20,7 @@ import os
 import platform
 import subprocess
 from enum import IntEnum, unique
+from typing import Optional
 
 import torch
 from packaging import version
@@ -118,6 +119,22 @@ def get_device_id() -> int:
         int: The current device index (e.g., 0 for 'cuda:0').
     """
     return get_platform().current_device()
+
+
+def get_device(index: Optional[int] = None) -> torch.device:
+    """Get a ``torch.device`` addressing the current accelerator.
+
+    Prefer this over :func:`get_device_id` for tensor placement: some accelerators
+    (e.g. TPU) bind one device per process and reject an indexed device.
+
+    Args:
+        index: device index to address, defaulting to this process' device.
+            Ignored by platforms without addressable device indices.
+
+    Returns:
+        torch.device: e.g. ``device('cuda', 0)`` or ``device('tpu')``.
+    """
+    return get_platform().torch_device(index)
 
 
 def get_nccl_backend() -> str:

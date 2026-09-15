@@ -199,10 +199,15 @@ class RolloutReplica(ABC):
         resource_pool_spec = {
             resource_pool_name: [self.gpus_per_replica_node] * self.nnodes,
         }
+        # A backend whose engine claims the accelerators itself wants these workers to
+        # hold none, but they must still land beside the engine, hence the node pin.
+        use_gpu = self.rollout_worker_use_gpu()
         resource_pool_manager = ResourcePoolManager(
             resource_pool_spec=resource_pool_spec,
             mapping=None,
             max_colocate_count=2,
+            use_gpu=use_gpu,
+            node_ip=None if use_gpu else self.rollout_worker_node_ip(),
         )
         resource_pool_manager.create_resource_pool()
         self.resource_pool = resource_pool_manager.resource_pool_dict[resource_pool_name]
@@ -219,7 +224,7 @@ class RolloutReplica(ABC):
             ray_cls_with_init=self.get_ray_class_with_init_args(),
             bin_pack=False,
             name_prefix=name_prefix,
-            use_gpu=True,
+            use_gpu=use_gpu,
             device_name=get_device_name(),
         )
         self.workers = worker_group.workers
@@ -261,6 +266,14 @@ class RolloutReplica(ABC):
 
     def rollout_worker_use_gpu(self) -> bool:
         return True
+
+    def rollout_worker_node_ip(self) -> Optional[str]:
+        """Host to pin accelerator-free rollout workers to, or None for anywhere.
+
+        Only consulted when :meth:`rollout_worker_use_gpu` is False, where the
+        accelerator request would otherwise no longer constrain placement.
+        """
+        return None
 
     async def wake_up(self):
         """Wake up each rollout server."""
@@ -374,8 +387,15 @@ def _load_trtllm():
     return TRTLLMReplica
 
 
+def _load_vllm_tpu():
+    from verl.workers.rollout.vllm_rollout.vllm_tpu_async_server import vLLMTPUReplica
+
+    return vLLMTPUReplica
+
+
 # Register built-in types
 RolloutReplicaRegistry.register("vllm", _load_vllm)
+RolloutReplicaRegistry.register("vllm_tpu", _load_vllm_tpu)
 RolloutReplicaRegistry.register("sglang", _load_sglang)
 RolloutReplicaRegistry.register("trtllm", _load_trtllm)
 

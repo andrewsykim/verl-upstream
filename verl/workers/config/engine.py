@@ -547,9 +547,7 @@ class TorchtitanEngineConfig(EngineConfig):
 
     def __post_init__(self):
         super().__post_init__()
-        assert self.attn_type in ["flex", "flex_flash", "varlen"], (
-            f"attn_type {self.attn_type} not supported (sdpa is not a valid language-model backend)"
-        )
+        assert self.attn_type in ["sdpa", "flex", "flex_flash", "varlen"], f"attn_type {self.attn_type} not supported"
         assert self.spmd_backend in ["default", "full_dtensor", "spmd_types"], (
             f"spmd_backend {self.spmd_backend} not supported"
         )

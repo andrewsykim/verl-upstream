@@ -451,6 +451,8 @@ class vLLMHttpServer:
         if self._disaggregation_role != "null":
             args["kv_transfer_config"] = json.dumps(self._disaggregation_kv_transfer_config)
 
+        self._postprocess_engine_args(args)
+
         server_args = ["serve", self.model_config.local_path] + build_cli_args_from_config(args)
 
         if self.replica_rank == 0:
@@ -1090,6 +1092,14 @@ class vLLMHttpServer:
         """Return the key under config.engine_kwargs for this engine (e.g. 'vllm')."""
         return "vllm"
 
+    def _postprocess_engine_args(self, args: dict) -> None:
+        """Mutate the assembled CLI args dict in-place, just before it is serialized.
+
+        Counterpart to :meth:`_preprocess_engine_kwargs`, for keys that verl sets
+        itself rather than taking from ``engine_kwargs``. Backends whose engine does
+        not accept verl's defaults override this.
+        """
+
     def _preprocess_engine_kwargs(self, engine_kwargs: dict) -> None:
         """Mutate engine_kwargs in-place before the CLI args dict is built."""
         if _VLLM_VERSION < version.parse("0.22.0"):
@@ -1298,13 +1308,14 @@ class vLLMReplica(RolloutReplica):
             f"worker number {len(self.workers)} not equal to world size {self.world_size}"
         )
 
-        # get (node_id, CUDA_VISIBLE_DEVICES) of all workers
+        # get (node_id, CUDA_VISIBLE_DEVICES) of all workers. Workers of a backend whose
+        # engine allocates the accelerators itself hold none, hence the empty default.
         worker_infos = await asyncio.gather(
             *[
                 worker.__ray_call__.remote(
                     lambda self: (
                         ray.get_runtime_context().get_node_id(),
-                        ray.get_runtime_context().get_accelerator_ids()[get_resource_name()][0],
+                        next(iter(ray.get_runtime_context().get_accelerator_ids().get(get_resource_name(), [])), ""),
                     )
                 )
                 for worker in self.workers
@@ -1331,6 +1342,7 @@ class vLLMReplica(RolloutReplica):
             env_vars = {
                 **{var: "1" for var in get_platform().ray_noset_envvars()},
                 **get_platform().rollout_env_vars(),
+                **self._server_env_vars(),
             }
 
             server = self.server_class.options(
@@ -1434,3 +1446,10 @@ class vLLMReplica(RolloutReplica):
     def _get_server_name_prefix(self) -> str:
         """Return the Ray actor name prefix (e.g. 'vllm_')."""
         return "vllm_"
+
+    def _server_env_vars(self) -> dict[str, str]:
+        """Extra environment for the server actors, merged over the platform's.
+
+        For backend state that is only known once the replica has been placed.
+        """
+        return {}

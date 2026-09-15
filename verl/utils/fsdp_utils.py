@@ -34,7 +34,7 @@ from torch.distributed.fsdp._runtime_utils import _lazy_init
 from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy, transformer_auto_wrap_policy
 from transformers.trainer_pt_utils import get_module_class_from_name
 
-from verl.utils.device import get_device_id, get_device_name, get_torch_device
+from verl.utils.device import get_device, get_device_id, get_device_name, get_torch_device
 from verl.utils.model import check_exclude_modules, check_target_modules
 
 logger = logging.getLogger(__name__)
@@ -56,7 +56,7 @@ else:
 
 def init_fn(x: torch.nn.Module):
     if torch.distributed.get_rank() != 0:
-        x = x.to_empty(device=get_device_id(), recurse=False)
+        x = x.to_empty(device=get_device(), recurse=False)
         get_torch_device().empty_cache()
     return x
 
@@ -233,7 +233,7 @@ def load_fsdp_model_to_gpu(model: FSDP):
 
 @torch.no_grad()
 def load_fsdp2_model_to_gpu(model):
-    device = get_device_id()
+    device = get_device()
     model.to(device, non_blocking=True)
 
 

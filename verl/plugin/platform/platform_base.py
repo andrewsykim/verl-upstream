@@ -200,6 +200,21 @@ class PlatformBase(abc.ABC):
         else:
             return f"{self.ray_resource_name()}-{device_id}"
 
+    def torch_device(self, index: Optional[int] = None) -> "torch.device":
+        """Return a ``torch.device`` addressing this process' accelerator.
+
+        Prefer this over the bare ``current_device()`` index whenever a device is
+        needed for tensor placement: platforms that bind one device per process
+        (TPU) have no meaningful device index and reject indexed device strings.
+
+        Args:
+            index: device index to address, defaulting to this process' device.
+                Platforms without addressable device indices ignore it.
+        """
+        import torch  # noqa: PLC0415
+
+        return torch.device(self.device_name, self.current_device() if index is None else index)
+
     def apply_model_patches(self, model_type: str) -> None:
         """Apply platform-specific model patches (e.g. replace ops unsupported on this device)."""
         return  # default no-op
@@ -217,6 +232,20 @@ class PlatformBase(abc.ABC):
     def ray_noset_envvars(self) -> list[str]:
         """Return ``RAY_EXPERIMENTAL_NOSET_*`` env var names for this platform."""
         ...
+
+    # ------------------------------------------------------------------
+    # Distributed bootstrap
+    # ------------------------------------------------------------------
+
+    def prepare_distributed_env(self) -> None:
+        """Finalize the process environment before ``init_process_group``.
+
+        Called once per worker, after rank/world-size/master-address are known and
+        before the accelerator runtime is touched. Platforms whose runtime is
+        configured purely through environment variables (e.g. TorchTPU's slice
+        builder) derive them here. No-op by default.
+        """
+        return None
 
     def ray_resource_options(self, num_gpus: float) -> dict[str, Any]:
         """Return Ray actor resource options for allocating accelerators.

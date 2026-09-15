@@ -37,7 +37,7 @@ from torch.distributed.device_mesh import DeviceMesh
 
 from verl import DataProto
 from verl.third_party.vllm import VLLM_SLEEP_LEVEL
-from verl.utils.device import is_support_ipc
+from verl.utils.device import get_device_name, is_support_ipc
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.base import BaseRollout
 from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import BucketedWeightSender
@@ -141,6 +141,13 @@ class ServerAdapter(BaseRollout):
         self.zmq_handle = f"ipc:///tmp/rl-colocate-zmq-{job_id}-replica-{self.replica_rank}-rank-{local_rank}.sock"
 
         self.use_shm = not is_support_ipc()
+        self.use_socket = False
+        if get_device_name() == "tpu":
+            self.use_socket = True
+            self.use_shm = False
+            self.sender_ip = ray.util.get_node_ip_address()
+            self.base_port = 28000
+            self.zmq_handle = f"tcp://0.0.0.0:{self.base_port + local_rank}"
         self._delta_weight_transfer_engine_initialized = False
         if self.use_shm:
             logger.warning(
@@ -229,7 +236,13 @@ class ServerAdapter(BaseRollout):
         future = await self._execute_method(
             "update_weights_from_ipc",
             non_block=True,
-            kwargs={**kwargs, "use_shm": self.use_shm},
+            kwargs={
+                **kwargs,
+                "use_shm": self.use_shm,
+                "use_socket": self.use_socket,
+                "sender_ip": getattr(self, "sender_ip", None),
+                "base_port": getattr(self, "base_port", 28000),
+            },
         )
 
         bucket_size_mb = self.config.checkpoint_engine.update_weights_bucket_megabytes
@@ -237,6 +250,7 @@ class ServerAdapter(BaseRollout):
             zmq_handle=self.zmq_handle,
             bucket_size_mb=bucket_size_mb,
             use_shm=self.use_shm,
+            use_socket=self.use_socket,
         )
         await sender.async_send_weights(weights)
 

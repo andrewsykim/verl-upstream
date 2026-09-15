@@ -33,6 +33,8 @@ from torchtitan.models.common.attention import (
     get_causal_mask_mod,
 )
 
+from verl.utils.device import get_torch_device
+
 logger = logging.getLogger(__name__)
 
 
@@ -180,13 +182,18 @@ def get_attention_masks(
                 input_batch,
                 positions,
             )
+        case "sdpa":
+            # torchtitan's sdpa backend calls F.scaled_dot_product_attention(is_causal=True)
+            # directly and takes no externally-built mask. Packed/document masking is
+            # therefore unavailable; callers must use one sequence per row.
+            return None
         case "varlen":
             return _create_varlen_metadata_for_document(
                 input_batch,
                 positions,
             )
         case _:
-            raise TypeError("Only varlen and flex attn masks are supported")
+            raise TypeError(f"Unsupported attn_type {attn_type!r}: expected one of sdpa, flex, flex_flash, varlen")
 
 
 def _get_document_mask_mod(positions: torch.Tensor) -> _mask_mod_signature:
@@ -356,4 +363,4 @@ def iter_per_tensor_params_ep(
             yield name_template.format(expert_id), all_experts[expert_id].to(torch.bfloat16).clone()
 
         del local_weights, local_stacked, gathered_list, all_experts
-        torch.cuda.empty_cache()
+        get_torch_device().empty_cache()
