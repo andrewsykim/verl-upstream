@@ -208,6 +208,7 @@ class RolloutReplica(ABC):
             max_colocate_count=2,
             use_gpu=use_gpu,
             node_ip=None if use_gpu else self.rollout_worker_node_ip(),
+            node_ips=None if use_gpu else self.rollout_worker_node_ips(),
         )
         resource_pool_manager.create_resource_pool()
         self.resource_pool = resource_pool_manager.resource_pool_dict[resource_pool_name]
@@ -269,6 +270,14 @@ class RolloutReplica(ABC):
 
     def rollout_worker_node_ip(self) -> Optional[str]:
         """Host to pin accelerator-free rollout workers to, or None for anywhere.
+
+        Only consulted when :meth:`rollout_worker_use_gpu` is False, where the
+        accelerator request would otherwise no longer constrain placement.
+        """
+        return None
+
+    def rollout_worker_node_ips(self) -> Optional[list[str]]:
+        """Hosts to pin accelerator-free rollout workers to, or None for anywhere.
 
         Only consulted when :meth:`rollout_worker_use_gpu` is False, where the
         accelerator request would otherwise no longer constrain placement.

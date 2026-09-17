@@ -61,7 +61,7 @@ def is_v7x(environ: dict | None = None) -> bool:
     devices, which changes both the rank accounting and the topology arity.
     """
     environ = os.environ if environ is None else environ
-    return environ.get("TPU_ACCELERATOR_TYPE", "").startswith("tpu7x")
+    return environ.get("TPU_ACCELERATOR_TYPE", "").startswith("tpu7x") or environ.get("VERL_TPU_GENERATION", "") == "v7x"
 
 
 def devices_per_chip(environ: dict | None = None) -> int:
@@ -77,6 +77,11 @@ def _slice_topology(world_size: int, num_hosts: int, environ: dict | None = None
     local host, so prefer it for a single-host slice and only fall back to the
     pre-existing ``TORCH_TPU_TOPOLOGY`` otherwise.
     """
+    environ = os.environ if environ is None else environ
+    inherited = environ.get("TORCH_TPU_TOPOLOGY", "")
+    if inherited:
+        return inherited
+
     if num_hosts == 1:
         try:
             from torch_tpu._internal.utils import hardware  # noqa: PLC0415
@@ -87,9 +92,65 @@ def _slice_topology(world_size: int, num_hosts: int, environ: dict | None = None
         except Exception:
             logger.warning("torch_tpu could not report a topology for %d devices", world_size, exc_info=True)
 
-    environ = os.environ if environ is None else environ
-    inherited = environ.get("TORCH_TPU_TOPOLOGY", "")
-    return inherited or None
+    if is_v7x(environ):
+        if world_size == 32:
+            return "2,2,4,2"
+        elif world_size == 8:
+            return "2,2,1,2"
+
+    return None
+
+
+def select_tpu_slice_nodes(required_devices_per_node: list[int], device_name: str = "TPU") -> list[dict]:
+    """Find a free TPU slice that can accommodate the required devices per node.
+
+    Args:
+        required_devices_per_node: List specifying the required TPU devices for each node in the slice.
+        device_name: Resource name for TPU devices in Ray (default "TPU").
+
+    Returns:
+        List of node dicts from `ray.nodes()` in the selected slice, ordered by `ray.io/tpu-worker-id`.
+    """
+    import ray
+
+    total_required = sum(required_devices_per_node)
+    num_nodes_required = len(required_devices_per_node)
+    available = ray._private.state.available_resources_per_node()
+
+    slices: dict[str, list[dict]] = {}
+    for node in ray.nodes():
+        if not node.get("Alive") or device_name not in node.get("Resources", {}):
+            continue
+        labels = node.get("Labels") or node.get("labels") or {}
+        slice_name = labels.get("ray.io/tpu-slice-name", node["NodeID"])
+        slices.setdefault(slice_name, []).append(node)
+
+    def _sort_key(node: dict) -> int:
+        labels = node.get("Labels") or node.get("labels") or {}
+        return int(labels.get("ray.io/tpu-worker-id", 0))
+
+    for name in sorted(slices):
+        nodes = sorted(slices[name], key=_sort_key)
+        if len(nodes) < num_nodes_required:
+            continue
+        if sum(int(n["Resources"][device_name]) for n in nodes) < total_required:
+            continue
+        is_free = True
+        for idx, req in enumerate(required_devices_per_node):
+            node_id = nodes[idx]["NodeID"]
+            avail = available.get(node_id, {}).get(device_name, 0)
+            if avail < req:
+                is_free = False
+                break
+        if not is_free:
+            continue
+        logger.info("Selected TPU slice %s (%d nodes) for required %s", name, len(nodes), required_devices_per_node)
+        return nodes[:num_nodes_required]
+
+    raise RuntimeError(
+        f"No free TPU slice with at least {total_required} {device_name} devices across {num_nodes_required} nodes. "
+        f"Slices seen: " + ", ".join(f"{name}({len(nodes)} nodes)" for name, nodes in sorted(slices.items()))
+    )
 
 
 def maybe_init_tpu_distributed_env(
@@ -201,7 +262,8 @@ def rollout_tpu_env_vars() -> dict[str, str]:
         # RL rollouts see a wide spread of sequence lengths; the default Dynamo
         # recompile limit trips long before the shapes stabilise.
         "TORCH_DYNAMO_RECOMPILE_LIMIT": "100",
-        "VLLM_ENABLE_V1_MULTIPROCESSING": "1",
+        "VLLM_ENABLE_V1_MULTIPROCESSING": "0",
         "SKIP_JAX_PRECOMPILE": "1",
         "TPU_SKIP_MDS_QUERY": "true",
+        "TPU_ACCELERATOR_TYPE": "tpu7x",
     }

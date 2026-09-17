@@ -69,7 +69,7 @@ def func_generator(self, method_name, dispatch_fn, collect_fn, execute_fn, block
 
 def sort_placement_group_by_node_ip(pgs: list[PlacementGroup]) -> list[PlacementGroup]:
     """
-    Sort the placement groups by node ip, all bundles in a single placement group should be on the same node.
+    Sort the placement groups by node ip or TPU worker id, all bundles in a single placement group should be on the same node.
 
     FSDPCheckpointManager saves sharded model states and optimizer states in local storage, which requires RANK
     to be consistent across nodes when resume from checkpoint.
@@ -77,14 +77,21 @@ def sort_placement_group_by_node_ip(pgs: list[PlacementGroup]) -> list[Placement
     With this function, if there's only one resource pool and there's no node change, RANK should be consistent
     across nodes in multiple ray jobs, even if the whole ray cluster is restarted.
     """
-    node_ip = {node["NodeID"]: node["NodeManagerAddress"] for node in ray.nodes()}
-    pg_ip = {}
+    node_map = {node["NodeID"]: node for node in ray.nodes()}
+    pg_key = {}
     for pg in pgs:
         specs = ray._private.state.state.placement_group_table(pg.id)
         # all bunles should be on the same node
         node_id = specs["bundles_to_node_id"][0]
-        pg_ip[pg.id] = node_ip[node_id]
-    return sorted(pgs, key=lambda pg: pg_ip[pg.id])
+        node = node_map.get(node_id, {})
+        labels = node.get("Labels") or node.get("labels") or {}
+        if "ray.io/tpu-worker-id" in labels:
+            slice_name = labels.get("ray.io/tpu-slice-name", "")
+            worker_id = int(labels["ray.io/tpu-worker-id"])
+            pg_key[pg.id] = (slice_name, worker_id)
+        else:
+            pg_key[pg.id] = node.get("NodeManagerAddress", "")
+    return sorted(pgs, key=lambda pg: pg_key[pg.id])
 
 
 @ray.remote
@@ -120,6 +127,7 @@ class RayResourcePool(ResourcePool):
         detached=False,
         accelerator_type: Optional[str] = None,
         node_ip: Optional[str] = None,
+        node_ips: Optional[list[str]] = None,
     ) -> None:
         super().__init__(process_on_nodes, max_colocate_count)
         self.use_gpu = use_gpu
@@ -129,6 +137,7 @@ class RayResourcePool(ResourcePool):
         self.detached = detached
         self.accelerator_type = accelerator_type
         self.node_ip = node_ip
+        self.node_ips = node_ips
 
     def get_placement_groups(self, strategy="STRICT_PACK", name=None, device_name="cuda"):
         if self.pgs is not None:
@@ -145,16 +154,30 @@ class RayResourcePool(ResourcePool):
             )
         device_name = current_platform.ray_resource_name()
 
+        # On TPU with use_gpu=True, auto-select a free TPU slice if node_ips is not provided
+        if self.node_ips is None and self.use_gpu and current_platform.device_name == "tpu":
+            try:
+                from verl.utils.tpu_utils import select_tpu_slice_nodes
+
+                slice_nodes = select_tpu_slice_nodes(self._store, device_name=device_name)
+                self.node_ips = [n["NodeManagerAddress"] for n in slice_nodes]
+            except Exception as e:
+                logger.warning("Could not auto-select TPU slice nodes: %s", e)
+
         bundle = {"CPU": self.max_colocate_count}
         if self.use_gpu:
             bundle[device_name] = 1
             if self.accelerator_type is not None:
                 bundle[self.accelerator_type] = 1e-4
-        if self.node_ip is not None:
-            # Ray advertises a `node:<ip>` resource on every node; requesting a sliver of
-            # it pins the placement group to that host without consuming anything real.
-            bundle[f"node:{self.node_ip}"] = 0.001
-        pg_scheme = [[bundle.copy() for _ in range(process_count)] for process_count in self._store]
+
+        pg_scheme = []
+        for idx, process_count in enumerate(self._store):
+            b = bundle.copy()
+            if self.node_ips is not None and idx < len(self.node_ips):
+                b[f"node:{self.node_ips[idx]}"] = 0.001
+            elif self.node_ip is not None:
+                b[f"node:{self.node_ip}"] = 0.001
+            pg_scheme.append([b.copy() for _ in range(process_count)])
 
         lifetime = "detached" if self.detached else None
 
@@ -199,6 +222,7 @@ class ResourcePoolManager:
     resource_pool_dict: dict[str, RayResourcePool] = field(default_factory=dict)
     use_gpu: bool = True
     node_ip: Optional[str] = None
+    node_ips: Optional[list[str]] = None
 
     def create_resource_pool(self):
         """Create Ray resource pools for distributed training.
@@ -219,6 +243,7 @@ class ResourcePoolManager:
                 max_colocate_count=self.max_colocate_count,
                 name_prefix=resource_pool_name,
                 node_ip=self.node_ip,
+                node_ips=self.node_ips,
             )
             self.resource_pool_dict[resource_pool_name] = resource_pool
 

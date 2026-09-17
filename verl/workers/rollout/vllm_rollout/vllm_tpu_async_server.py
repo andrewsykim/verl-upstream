@@ -61,6 +61,52 @@ _FROZEN_TPU_ENV_KEYS = (
     "TORCH_TPU_TOPOLOGY",
 )
 
+def _patch_platform_noset_env_vars():
+    """Ensure vLLM's TPU platform declares RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS
+    and excludes TPU_VISIBLE_CHIPS / TPU_VISIBLE_DEVICES from worker env copying.
+
+    Without this, Ray injects TPU_VISIBLE_CHIPS="0" on RayWorkerProc actors created with
+    resources={"TPU": 1}. When subsequent tasks call get_node_and_physical_gpu_ids(),
+    Ray tries to index assigned_ids into original_ids (which only contains ["0"]),
+    causing an IndexError for all TPU device indices > 0 on multi-device hosts.
+    """
+    try:
+        from vllm.platforms import current_platform
+
+        if "RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS" not in current_platform.ray_noset_device_env_vars:
+            current_platform.ray_noset_device_env_vars = list(current_platform.ray_noset_device_env_vars) + [
+                "RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS"
+            ]
+    except Exception:
+        pass
+    try:
+        from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
+
+        if "RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS" not in TpuPlatform.ray_noset_device_env_vars:
+            TpuPlatform.ray_noset_device_env_vars = list(TpuPlatform.ray_noset_device_env_vars) + [
+                "RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS"
+            ]
+    except Exception:
+        pass
+    try:
+        from vllm.v1.executor.ray_utils import WORKER_SPECIFIC_ENV_VARS
+
+        WORKER_SPECIFIC_ENV_VARS.update({"TPU_VISIBLE_CHIPS", "TPU_VISIBLE_DEVICES"})
+    except Exception:
+        pass
+    try:
+        from vllm.ray.ray_env import RAY_NON_CARRY_OVER_ENV_VARS
+
+        RAY_NON_CARRY_OVER_ENV_VARS.update({"TPU_VISIBLE_CHIPS", "TPU_VISIBLE_DEVICES"})
+    except Exception:
+        pass
+    try:
+        from verl.workers.rollout.vllm_rollout.utils import patch_vllm_tpu_multihost_dp
+
+        patch_vllm_tpu_multihost_dp()
+    except Exception:
+        pass
+
 
 def confine_vllm_to_slice(allowed_ips: set[str]) -> None:
     """Stop vLLM's TPU Ray executor from absorbing the whole cluster into one slice.
@@ -80,6 +126,9 @@ def confine_vllm_to_slice(allowed_ips: set[str]) -> None:
     Hiding the other slices makes the executor's own derivation correct. Must be
     called in the process that constructs the engine.
     """
+    _patch_platform_noset_env_vars()
+    os.environ.pop("TPU_VISIBLE_CHIPS", None)
+    os.environ.pop("TPU_VISIBLE_DEVICES", None)
     if getattr(ray, "_verl_tpu_slice_confined", False):
         return
 
@@ -118,8 +167,10 @@ def confine_vllm_to_slice(allowed_ips: set[str]) -> None:
 
     os.environ.__class__.__setitem__ = patched_setitem
 
-    # Also patch RayDistributedExecutorV2 / RayDistributedExecutor so that even if
-    # _slice_host_layout inspects the cluster, it filters out hosts not in allowed_ips.
+    # Also patch RayDistributedExecutorV2 / RayDistributedExecutor so that:
+    # 1. _slice_host_layout filters out hosts not in allowed_ips.
+    # 2. _get_dp_geometry correctly returns (dp_size, dp_rank, slice_world_size)
+    #    even when EngineCoreActor reconfigures parallel_config for independent DP.
     for mod_name in (
         "vllm_torchtpu.executors.ray_distributed_executor_v2",
         "vllm_torchtpu.executors.ray_distributed_executor",
@@ -134,7 +185,14 @@ def confine_vllm_to_slice(allowed_ips: set[str]) -> None:
                     def make_patched(orig):
                         def patched_layout(self, device_str: str):
                             hosts, chips = orig(self, device_str)
-                            filtered_hosts = [h for h in hosts if h in allowed_ips]
+                            placement_ips = os.environ.get("VLLM_RAY_DP_PLACEMENT_NODE_IPS") or os.environ.get(
+                                "VERL_TPU_ROLLOUT_SLICE_IPS"
+                            )
+                            if placement_ips:
+                                ordered = [ip.strip() for ip in placement_ips.split(",") if ip.strip()]
+                                filtered_hosts = [h for h in ordered if h in allowed_ips]
+                            else:
+                                filtered_hosts = [h for h in hosts if h in allowed_ips]
                             filtered_chips = {k: v for k, v in chips.items() if k in allowed_ips}
                             return filtered_hosts, filtered_chips
 
@@ -142,6 +200,26 @@ def confine_vllm_to_slice(allowed_ips: set[str]) -> None:
 
                     cls._slice_host_layout = make_patched(orig_layout)
                     cls._verl_patched = True
+
+                if cls and hasattr(cls, "_get_dp_geometry") and not getattr(cls, "_verl_geom_patched", False):
+                    orig_geom = cls._get_dp_geometry
+
+                    def make_patched_geom(orig):
+                        def patched_geom(self):
+                            dp_size, dp_rank, slice_world_size = orig(self)
+                            if dp_size <= 1 and (dp_rank > 0 or len(allowed_ips) > 1):
+                                env_dp_size = int(os.environ.get("TORCH_TPU_DP_SIZE", "0"))
+                                effective_dp_size = env_dp_size or len(allowed_ips)
+                                dp_index = getattr(self.parallel_config, "data_parallel_index", None)
+                                if dp_index is None:
+                                    dp_index = getattr(self.parallel_config, "data_parallel_rank", 0) or 0
+                                return effective_dp_size, int(dp_index), self.world_size * effective_dp_size
+                            return dp_size, dp_rank, slice_world_size
+
+                        return patched_geom
+
+                    cls._get_dp_geometry = make_patched_geom(orig_geom)
+                    cls._verl_geom_patched = True
         except Exception as exc:
             logger.debug("Could not patch %s: %s", mod_name, exc)
 
@@ -163,9 +241,12 @@ def _run_confined_engine_core(*args, **kwargs):
     this function ensures the child process applies slice confinement before
     constructing RayDistributedExecutor.
     """
+    os.environ.pop("TPU_VISIBLE_CHIPS", None)
+    os.environ.pop("TPU_VISIBLE_DEVICES", None)
     slice_ips = os.environ.get("VERL_TPU_ROLLOUT_SLICE_IPS", "")
     if slice_ips:
         confine_vllm_to_slice({ip.strip() for ip in slice_ips.split(",") if ip.strip()})
+    _patch_platform_noset_env_vars()
     from vllm.v1.engine.core import EngineCoreProc
 
     target_fn = _ORIGINAL_RUN_ENGINE_CORE or getattr(EngineCoreProc, "_verl_original_run_engine_core", None)
@@ -201,6 +282,10 @@ class vLLMTPUHttpServer(vLLMHttpServer):
 
     def _post_init(self, cuda_visible_devices: str) -> None:
         super()._post_init(cuda_visible_devices)
+        os.environ.pop("TPU_VISIBLE_CHIPS", None)
+        os.environ.pop("TPU_VISIBLE_DEVICES", None)
+        if getattr(self, "config", None) and getattr(self.config, "data_parallel_size", 1) > 1:
+            os.environ["TORCH_TPU_DP_SIZE"] = str(self.config.data_parallel_size)
         # The engine is constructed later in launch_server(), but the executor reads
         # ray.nodes() from this process, so confine it now.
         slice_ips = os.environ.get("VERL_TPU_ROLLOUT_SLICE_IPS", "")
@@ -209,17 +294,39 @@ class vLLMTPUHttpServer(vLLMHttpServer):
 
     async def run_server(self, args):
         global _ORIGINAL_RUN_ENGINE_CORE
+        if getattr(self, "config", None) and getattr(self.config, "data_parallel_size", 1) > 1:
+            os.environ["TORCH_TPU_DP_SIZE"] = str(self.config.data_parallel_size)
         try:
-            from vllm.v1.engine.core import EngineCoreProc
+            from vllm.v1.engine.core import EngineCoreActor, EngineCoreProc
 
             if not hasattr(EngineCoreProc, "_verl_original_run_engine_core"):
                 EngineCoreProc._verl_original_run_engine_core = EngineCoreProc.run_engine_core
             if _ORIGINAL_RUN_ENGINE_CORE is None:
                 _ORIGINAL_RUN_ENGINE_CORE = EngineCoreProc._verl_original_run_engine_core
             EngineCoreProc.run_engine_core = _run_confined_engine_core
-        except Exception as exc:
-            logger.warning("Could not patch EngineCoreProc.run_engine_core: %s", exc)
 
+            if not hasattr(EngineCoreActor, "_verl_original_init"):
+                orig_actor_init = EngineCoreActor.__init__
+
+                def _confined_actor_init(self, *args, **kwargs):
+                    os.environ.pop("TPU_VISIBLE_CHIPS", None)
+                    os.environ.pop("TPU_VISIBLE_DEVICES", None)
+                    slice_ips = os.environ.get("VERL_TPU_ROLLOUT_SLICE_IPS", "")
+                    if slice_ips:
+                        confine_vllm_to_slice({ip.strip() for ip in slice_ips.split(",") if ip.strip()})
+                    if "TORCH_TPU_DP_SIZE" not in os.environ and slice_ips:
+                        num_hosts = len([ip for ip in slice_ips.split(",") if ip.strip()])
+                        if num_hosts > 1:
+                            os.environ["TORCH_TPU_DP_SIZE"] = str(num_hosts)
+                    _patch_platform_noset_env_vars()
+                    orig_actor_init(self, *args, **kwargs)
+
+                EngineCoreActor.__init__ = _confined_actor_init
+                EngineCoreActor._verl_original_init = orig_actor_init
+        except Exception as exc:
+            logger.warning("Could not patch EngineCoreProc/Actor: %s", exc)
+
+        _patch_platform_noset_env_vars()
         await super().run_server(args)
         # Must happen before the first generation, which is what triggers the first
         # TPU compilation in each worker.
@@ -230,6 +337,18 @@ class vLLMTPUHttpServer(vLLMHttpServer):
         # rendezvous, and the multiproc executor only emits one behind a ROCm-specific
         # branch.
         args["distributed_executor_backend"] = "ray"
+        if args.get("data_parallel_size", 1) > 1:
+            args["data_parallel_backend"] = "ray"
+            args.pop("nnodes", None)
+            args.pop("node_rank", None)
+            args.pop("master_addr", None)
+            args.pop("master_port", None)
+            args.pop("data_parallel_start_rank", None)
+            args["data_parallel_size_local"] = max(
+                1, self.gpus_per_node // max(1, self.config.tensor_model_parallel_size)
+            )
+            args.pop("data_parallel_address", None)
+            args.pop("data_parallel_rpc_port", None)
         # Torch-compiled graph capture, sleep mode and the HBM fraction knob are all
         # CUDA-only; the TPU engine rejects them.
         for unsupported in ("compilation_config", "enable_sleep_mode", "gpu_memory_utilization"):
@@ -271,6 +390,9 @@ class vLLMTPUReplica(vLLMReplica):
 
     def rollout_worker_node_ip(self) -> Optional[str]:
         return self._rollout_slice_nodes()[0]["NodeManagerAddress"]
+
+    def rollout_worker_node_ips(self) -> Optional[list[str]]:
+        return [n["NodeManagerAddress"] for n in self._rollout_slice_nodes()]
 
     def _rollout_slice_nodes(self) -> list[dict]:
         """Pick the TPU slice this replica should generate on.
@@ -334,7 +456,7 @@ class vLLMTPUReplica(vLLMReplica):
             for i in range(devices_per_host)
         ]
         world_size = len(addresses)
-        topology = "2,2,1,2" if world_size == 8 else f"1,1,1,{world_size}"
+        topology = "2,2,4,2" if world_size == 32 else ("2,2,1,2" if world_size == 8 else f"1,1,1,{world_size}")
 
         libtpu_init_args = " ".join(
             [
@@ -350,6 +472,7 @@ class vLLMTPUReplica(vLLMReplica):
             "TORCH_TPU_BASE_PORT": str(ROLLOUT_SLICEBUILDER_BASE_PORT),
             "TORCH_TPU_SLICEBUILDER_ADDRESSES": ",".join(addresses),
             "TORCH_TPU_TOPOLOGY": topology,
+            "TORCH_TPU_DP_SIZE": str(self.config.data_parallel_size),
             "TPU_ACCELERATOR_TYPE": "tpu7x",
             "TPU_NAME": "tpu-rollout",
             "TPU_WORKER_ID": "0",
@@ -367,6 +490,16 @@ class vLLMTPUReplica(vLLMReplica):
             "TPU_CHIPS_PER_HOST_BOUNDS": "1,1,1,1",
             "TPU_MULTIHOST_BACKEND": "ray",
             "VLLM_ENABLE_V1_MULTIPROCESSING": "0",
+            "VLLM_USE_RAY_V2_EXECUTOR_BACKEND": "1",
+            "VLLM_RAY_DP_PLACEMENT_NODE_IPS": ",".join(host_ips),
+            "VLLM_RAY_DP_PACK_STRATEGY": "strict",
+            "VLLM_RAY_EXTRA_ENV_VAR_PREFIXES_TO_COPY": "VERL_,TORCH_TPU_,RAY_",
+            "VLLM_RAY_EXTRA_ENV_VARS_TO_COPY": (
+                "TPU_ACCELERATOR_TYPE,TPU_NAME,TPU_HOST_BOUNDS,TPU_CHIPS_PER_HOST_BOUNDS,"
+                "TPU_MULTIHOST_BACKEND,TPU_SKIP_MDS_QUERY,RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS,"
+                "LIBTPU_INIT_ARGS,SKIP_JAX_PRECOMPILE,TORCH_TPU_DP_SIZE,TORCH_TPU_SLICEBUILDER_ADDRESSES,"
+                "TORCH_TPU_TOPOLOGY,TPU_PROCESS_ADDRESSES"
+            ),
         }
 
     async def launch_servers(self):
@@ -376,54 +509,50 @@ class vLLMTPUReplica(vLLMReplica):
         )
 
         slice_nodes = self._rollout_slice_nodes()
-        nnodes, gpus_per_replica_node = self.nnodes, self.gpus_per_replica_node
+        prefix = self._get_server_name_prefix()
+        if self.is_reward_model:
+            name = f"{prefix}server_reward_{self.replica_rank}_0{self.name_suffix}"
+        elif self.is_teacher_model:
+            name = f"{prefix}server_teacher_{self.replica_rank}_0{self.name_suffix}"
+        else:
+            name = f"{prefix}server_{self.replica_rank}_0{self.name_suffix}"
 
-        for node_rank in range(nnodes):
-            workers = self.workers[node_rank * gpus_per_replica_node : (node_rank + 1) * gpus_per_replica_node]
-            node_id = slice_nodes[node_rank]["NodeID"]
-            prefix = self._get_server_name_prefix()
-            if self.is_reward_model:
-                name = f"{prefix}server_reward_{self.replica_rank}_{node_rank}{self.name_suffix}"
-            elif self.is_teacher_model:
-                name = f"{prefix}server_teacher_{self.replica_rank}_{node_rank}{self.name_suffix}"
-            else:
-                name = f"{prefix}server_{self.replica_rank}_{node_rank}{self.name_suffix}"
-            env_vars = {
-                **{var: "1" for var in get_platform().ray_noset_envvars()},
-                **get_platform().rollout_env_vars(),
-                **self._server_env_vars(),
-            }
+        env_vars = {
+            **{var: "1" for var in get_platform().ray_noset_envvars()},
+            **get_platform().rollout_env_vars(),
+            **self._server_env_vars(),
+        }
+        env_vars.pop("TPU_VISIBLE_CHIPS", None)
+        env_vars.pop("TPU_VISIBLE_DEVICES", None)
 
-            server = self.server_class.options(
-                scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
-                    node_id=node_id,
-                    soft=False,
-                ),
-                runtime_env={"env_vars": env_vars},
-                name=name,
-                max_concurrency=self.max_concurrency,
-            ).remote(
-                config=self.config,
-                model_config=self.model_config,
-                rollout_mode=self.rollout_mode,
-                workers=workers,
-                replica_rank=self.replica_rank,
-                node_rank=node_rank,
-                gpus_per_node=gpus_per_replica_node,
-                nnodes=nnodes,
-                cuda_visible_devices="",
-            )
-            self.servers.append(server)
+        # In TPU multi-host ray DP, a single server actor on node 0 drives all workers across the slice.
+        node_id = slice_nodes[0]["NodeID"]
+        workers = self.workers[: self.gpus_per_replica_node]
+        server = self.server_class.options(
+            scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
+                node_id=node_id,
+                soft=False,
+            ),
+            runtime_env={"env_vars": env_vars},
+            name=name,
+            max_concurrency=self.max_concurrency,
+        ).remote(
+            config=self.config,
+            model_config=self.model_config,
+            rollout_mode=self.rollout_mode,
+            workers=workers,
+            replica_rank=self.replica_rank,
+            node_rank=0,
+            gpus_per_node=self.gpus_per_replica_node,
+            nnodes=self.nnodes,
+            cuda_visible_devices="",
+        )
+        self.servers = [server]
 
-        # launch http server in each node
+        # launch http server on node 0
         master_address, master_port, dp_rpc_port = await self.servers[0].get_master_address.remote()
-        await asyncio.gather(
-            *[
-                server.launch_server.remote(
-                    master_address=master_address, master_port=master_port, dp_rpc_port=dp_rpc_port
-                )
-                for server in self.servers
-            ]
+        await self.servers[0].launch_server.remote(
+            master_address=master_address, master_port=master_port, dp_rpc_port=dp_rpc_port
         )
 
         # get http server address from first server

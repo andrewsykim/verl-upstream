@@ -22,10 +22,18 @@ set -xeuo pipefail
 # told not to pin chips itself: verl derives each rank's device from its rank and hands
 # it to torch_tpu via TPU_VISIBLE_DEVICES, and a Ray-set TPU_VISIBLE_CHIPS only adds a
 # second, silently-overridden opinion.
+# Ensure TPU_VISIBLE_CHIPS and TPU_VISIBLE_DEVICES are never inherited by Ray workers
+unset TPU_VISIBLE_CHIPS || true
+unset TPU_VISIBLE_DEVICES || true
+
 export VERL_PLATFORM=${VERL_PLATFORM:-tpu}
 export RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS=${RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS:-1}
+export VLLM_RAY_EXTRA_ENV_VARS_TO_COPY=${VLLM_RAY_EXTRA_ENV_VARS_TO_COPY:-TPU_ACCELERATOR_TYPE,TPU_NAME,TPU_HOST_BOUNDS,TPU_CHIPS_PER_HOST_BOUNDS,TPU_MULTIHOST_BACKEND,TPU_SKIP_MDS_QUERY,RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS,LIBTPU_INIT_ARGS,SKIP_JAX_PRECOMPILE,TORCH_TPU_DP_SIZE,TORCH_TPU_SLICEBUILDER_ADDRESSES,TORCH_TPU_TOPOLOGY,TPU_PROCESS_ADDRESSES}
+export VLLM_RAY_EXTRA_ENV_VAR_PREFIXES_TO_COPY=${VLLM_RAY_EXTRA_ENV_VAR_PREFIXES_TO_COPY:-VERL_,TORCH_TPU_,RAY_}
 export PYTHONUNBUFFERED=1
 export TPU_SKIP_MDS_QUERY=true
+export TPU_ACCELERATOR_TYPE=${TPU_ACCELERATOR_TYPE:-tpu7x}
+export TORCH_TPU_DP_SIZE=${TORCH_TPU_DP_SIZE:-4}
 
 # Deep transformer stacks blow the default limit while AOT-tracing on TPU.
 export TORCH_DYNAMO_RECOMPILE_LIMIT=${TORCH_DYNAMO_RECOMPILE_LIMIT:-100}
@@ -33,7 +41,7 @@ export TORCH_DYNAMO_RECOMPILE_LIMIT=${TORCH_DYNAMO_RECOMPILE_LIMIT:-100}
 # --- Topology -----------------------------------------------------------------
 # PJRT devices per host, NOT chips: a v7x chip exposes two.
 NUM_TPU=${NUM_TPU:-8}
-NNODES=${NNODES:-1}
+NNODES=${NNODES:-4}
 
 # --- Assets -------------------------------------------------------------------
 # Defaults point at the GCS-fuse mount shared by every pod in the cluster, so no
@@ -49,7 +57,7 @@ MAX_MODEL_LEN=${MAX_MODEL_LEN:-1024}
 # --- torchtitan parallelism ---------------------------------------------------
 # Pure FSDP2 across the slice. TP would need the TPU mesh to match the physical
 # 2x2x1 torus, so leave it at 1 until that is validated.
-FSDP_SIZE=${FSDP_SIZE:-${NUM_TPU}}
+FSDP_SIZE=${FSDP_SIZE:-$((NUM_TPU * NNODES))}
 TP_SIZE=${TP_SIZE:-1}
 EP_SIZE=${EP_SIZE:-1}
 
@@ -69,8 +77,8 @@ VERL_EXP_NAME=${VERL_EXP_NAME:-qwen3-0.6b-torchtitan-tpu7x}
 # Keep the global batch an exact multiple of the device count so every rank gets the
 # same number of tokens: TPU recompiles on every new shape, and a ragged tail would
 # also desynchronize the collectives.
-TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-$((NUM_TPU * 4))}
-PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-${NUM_TPU}}
+TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-$((NUM_TPU * NNODES * 4))}
+PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-$((NUM_TPU * NNODES))}
 MICRO_BATCH_SIZE_PER_GPU=${MICRO_BATCH_SIZE_PER_GPU:-1}
 ROLLOUT_N=${ROLLOUT_N:-4}
 
@@ -111,6 +119,7 @@ common_params=(
     actor_rollout_ref.rollout.name=vllm_tpu
     actor_rollout_ref.rollout.mode=async
     actor_rollout_ref.rollout.tensor_model_parallel_size="${NUM_TPU}"
+    actor_rollout_ref.rollout.data_parallel_size="${NNODES}"
     actor_rollout_ref.rollout.max_model_len="${MAX_MODEL_LEN}"
     actor_rollout_ref.rollout.n="${ROLLOUT_N}"
     actor_rollout_ref.rollout.n_gpus_per_node="${NUM_TPU}"

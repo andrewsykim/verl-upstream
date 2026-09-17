@@ -23,9 +23,19 @@ import os
 _slice_ips = os.environ.get("VERL_TPU_ROLLOUT_SLICE_IPS")
 if _slice_ips:
     allowed_ips = {ip.strip() for ip in _slice_ips.split(",") if ip.strip()}
+    if "TORCH_TPU_DP_SIZE" not in os.environ and len(allowed_ips) > 1:
+        os.environ["TORCH_TPU_DP_SIZE"] = str(len(allowed_ips))
     try:
         from verl.workers.rollout.vllm_rollout.vllm_tpu_async_server import confine_vllm_to_slice
 
         confine_vllm_to_slice(allowed_ips)
     except Exception as exc:
         logging.getLogger(__name__).warning("sitecustomize: failed to confine vLLM to slice: %s", exc)
+
+try:
+    from verl.workers.rollout.vllm_rollout.utils import patch_vllm_tpu_multihost_dp
+
+    patch_vllm_tpu_multihost_dp()
+except Exception:
+    pass
+

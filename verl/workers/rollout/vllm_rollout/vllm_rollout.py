@@ -148,6 +148,13 @@ class ServerAdapter(BaseRollout):
             self.sender_ip = ray.util.get_node_ip_address()
             self.base_port = 28000
             self.zmq_handle = f"tcp://0.0.0.0:{self.base_port + local_rank}"
+            if torch.distributed.is_initialized():
+                gathered_ips = [None for _ in range(torch.distributed.get_world_size())]
+                torch.distributed.all_gather_object(gathered_ips, self.sender_ip)
+                seen = set()
+                self.sender_ips = [ip for ip in gathered_ips if not (ip in seen or seen.add(ip))]
+            else:
+                self.sender_ips = [self.sender_ip]
         self._delta_weight_transfer_engine_initialized = False
         if self.use_shm:
             logger.warning(
@@ -164,7 +171,9 @@ class ServerAdapter(BaseRollout):
         # Lazy init http server adapter because http server is launched after hybrid engine.
         if self.server_handle is None:
             prefix = self._get_server_name_prefix()
-            if self._pd_role == "prefill":
+            if get_device_name() == "tpu":
+                actor_name = f"{prefix}server_{self.replica_rank}_0"
+            elif self._pd_role == "prefill":
                 actor_name = f"{prefix}server_{self.replica_rank}_0"
             elif self._pd_role == "decode":
                 actor_name = f"{prefix}server_decode_{self.replica_rank}_{self._pd_server_index}"
@@ -233,6 +242,20 @@ class ServerAdapter(BaseRollout):
         )
         start_time = time.time()
 
+        sender_ips = getattr(self, "sender_ips", None)
+        if getattr(self, "use_socket", False) and (
+            sender_ips is None
+            or (len(sender_ips) == 1 and torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1)
+        ):
+            if torch.distributed.is_initialized():
+                gathered_ips = [None for _ in range(torch.distributed.get_world_size())]
+                torch.distributed.all_gather_object(gathered_ips, self.sender_ip)
+                seen = set()
+                self.sender_ips = [ip for ip in gathered_ips if not (ip in seen or seen.add(ip))]
+            else:
+                self.sender_ips = [getattr(self, "sender_ip", None)]
+            sender_ips = self.sender_ips
+
         future = await self._execute_method(
             "update_weights_from_ipc",
             non_block=True,
@@ -241,6 +264,7 @@ class ServerAdapter(BaseRollout):
                 "use_shm": self.use_shm,
                 "use_socket": self.use_socket,
                 "sender_ip": getattr(self, "sender_ip", None),
+                "sender_ips": sender_ips,
                 "base_port": getattr(self, "base_port", 28000),
             },
         )

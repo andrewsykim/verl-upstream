@@ -132,7 +132,10 @@ class vLLMHttpServer:
         self._pd_prefill_engine_id: Optional[str] = None
         self._pd_peer_idx: int = 0
 
-        os.environ[get_visible_devices_keyword()] = cuda_visible_devices
+        if cuda_visible_devices:
+            os.environ[get_visible_devices_keyword()] = cuda_visible_devices
+        else:
+            os.environ.pop(get_visible_devices_keyword(), None)
         os.environ["VERL_REPLICA_RANK"] = str(replica_rank)
         # Forward the Ray job id into the vLLM worker subprocess so the
         # colocated weight-transfer IPC socket path is unique per Ray job.
