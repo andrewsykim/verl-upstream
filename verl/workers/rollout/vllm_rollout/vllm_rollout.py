@@ -64,6 +64,7 @@ class ServerAdapter(BaseRollout):
 
         rank = int(os.environ["RANK"])
         local_world_size = int(os.environ["RAY_LOCAL_WORLD_SIZE"])
+        self.local_world_size = local_world_size
         # PD asymmetric layout inflates per-replica footprint; must match
         # llm_server.py:_initialize_llm_servers or trainer-to-replica mapping breaks.
         prefill_tp = self.config.tensor_model_parallel_size
@@ -266,6 +267,9 @@ class ServerAdapter(BaseRollout):
                 "sender_ip": getattr(self, "sender_ip", None),
                 "sender_ips": sender_ips,
                 "base_port": getattr(self, "base_port", 28000),
+                "sender_local_world_size": getattr(
+                    self, "local_world_size", int(os.environ.get("RAY_LOCAL_WORLD_SIZE", "8"))
+                ),
             },
         )
 

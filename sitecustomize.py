@@ -33,9 +33,10 @@ if _slice_ips:
         logging.getLogger(__name__).warning("sitecustomize: failed to confine vLLM to slice: %s", exc)
 
 try:
-    from verl.workers.rollout.vllm_rollout.utils import patch_vllm_tpu_multihost_dp
+    from verl.workers.rollout.vllm_rollout.utils import patch_vllm_tpu_multihost_dp, patch_vllm_tpu_rpa_vmem
 
     patch_vllm_tpu_multihost_dp()
+    patch_vllm_tpu_rpa_vmem()
 except Exception:
     pass
 

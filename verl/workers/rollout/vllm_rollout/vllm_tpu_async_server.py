@@ -247,6 +247,7 @@ def _run_confined_engine_core(*args, **kwargs):
     if slice_ips:
         confine_vllm_to_slice({ip.strip() for ip in slice_ips.split(",") if ip.strip()})
     _patch_platform_noset_env_vars()
+    patch_vllm_tpu_multihost_dp()
     from vllm.v1.engine.core import EngineCoreProc
 
     target_fn = _ORIGINAL_RUN_ENGINE_CORE or getattr(EngineCoreProc, "_verl_original_run_engine_core", None)

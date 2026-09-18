@@ -27,7 +27,7 @@ from typing import Any, Literal, Optional, get_args
 import torch
 from vllm.outputs import RequestOutput
 
-from verl.utils.device import get_device, get_device_name, is_npu_available
+from verl.utils.device import get_device, is_npu_available
 from verl.utils.vllm import TensorLoRARequest, VLLMHijack, resolve_weight_name
 from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
 from verl.utils.vllm.vllm_quant_utils import apply_vllm_quant_patches, is_fp8_model, load_quanted_weights
@@ -147,8 +147,83 @@ def monkey_patch_compute_logits(model, vocab_size: int, banned_token_ids: Option
     model.compute_logits = MethodType(compute_logits, model)
 
 
+def patch_vllm_tpu_rpa_vmem():
+    """Cap ragged paged attention (RPA) tile sizes to prevent TPU VMEM OOM (RESOURCE_EXHAUSTED).
+
+    Physical VMEM on TPU v7x (and v5/v6) is 64 MB (usable ~63.94 MB).
+    In vllm_torchtpu RPA v3 kernel, default case 7 sets bq_sz=1024, bkv_sz=2048, which requires
+    67.71 MB VMEM for scratch operands and spill slots, causing XLA compilation to permanently fail.
+    Capping tile sizes to TPU v5/v6 standards (bkv_sz <= 1024, bq_sz <= 512, bq_csz <= 256)
+    reduces VMEM usage to ~34 MB while maintaining high compute throughput.
+    """
+    try:
+        def _apply_rpa_block_size_patch(rpa_mod):
+            if hasattr(rpa_mod, "get_default_block_sizes") and not getattr(rpa_mod, "_verl_vmem_capped", False):
+                orig_get_default_block_sizes = rpa_mod.get_default_block_sizes
+
+                def patched_get_default_block_sizes(*args, **kwargs):
+                    bs = orig_get_default_block_sizes(*args, **kwargs)
+                    if bs.get("bkv_sz", 0) > 1024:
+                        bs["bkv_sz"] = 1024
+                    if bs.get("bq_sz", 0) > 512:
+                        bs["bq_sz"] = 512
+                    if bs.get("bq_csz", 0) > 256:
+                        bs["bq_csz"] = 256
+                    bs["bq_csz"] = min(bs.get("bq_csz", 256), bs.get("bq_sz", 512))
+                    if bs.get("bkv_csz", 0) > 512:
+                        bs["bkv_csz"] = 512
+                    bs["bkv_csz"] = min(bs.get("bkv_csz", 512), bs.get("bkv_sz", 1024))
+                    return bs
+
+                rpa_mod.get_default_block_sizes = patched_get_default_block_sizes
+                rpa_mod._verl_vmem_capped = True
+                msg = "[verl] Patched vllm_torchtpu RPA get_default_block_sizes to prevent TPU VMEM OOM"
+                print(msg, flush=True)
+                logger.info("%s", msg)
+
+        try:
+            import vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel as rpa_v3
+
+            _apply_rpa_block_size_patch(rpa_v3)
+        except Exception:
+            pass
+
+        import sys
+
+        rpa_mod_name = "vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel"
+        if rpa_mod_name in sys.modules:
+            _apply_rpa_block_size_patch(sys.modules[rpa_mod_name])
+
+        if "vllm_torchtpu.layers.common.attention_interface" in sys.modules:
+            ai = sys.modules["vllm_torchtpu.layers.common.attention_interface"]
+            if hasattr(ai, "rpa_default"):
+                _apply_rpa_block_size_patch(ai.rpa_default)
+
+        import builtins
+
+        if not getattr(builtins, "_verl_rpa_import_hooked", False):
+            orig_import = builtins.__import__
+
+            def patched_import(name, *args, **kwargs):
+                mod = orig_import(name, *args, **kwargs)
+                if "ragged_paged_attention" in name or "attention_interface" in name:
+                    rpa_mod_name = "vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel"
+                    if rpa_mod_name in sys.modules:
+                        _apply_rpa_block_size_patch(sys.modules[rpa_mod_name])
+                    if "vllm_torchtpu.layers.common.attention_interface" in sys.modules:
+                        ai_mod = sys.modules["vllm_torchtpu.layers.common.attention_interface"]
+                        if hasattr(ai_mod, "rpa_default"):
+                            _apply_rpa_block_size_patch(ai_mod.rpa_default)
+                return mod
+
+            builtins.__import__ = patched_import
+            builtins._verl_rpa_import_hooked = True
+    except Exception as exc:
+        logger.debug("Could not patch RPA block sizes: %s", exc)
+
+
 def patch_vllm_tpu_multihost_dp():
-    """Monkey-patch vllm_torchtpu for multi-host data parallelism.
+    """Monkey-patch vllm_torchtpu for multi-host data parallelism and TPU VMEM safety.
 
     1. In `vllm_torchtpu.worker.tpu_rank_binding`: By default, `_slice_binding_from_env`
        is only called when `enable_expert_parallel=True`. For dense models (e.g. Qwen),
@@ -161,7 +236,10 @@ def patch_vllm_tpu_multihost_dp():
        addresses and sets TORCH_TPU_TOPOLOGY to an 8-chip slice, breaking multi-host
        mesh initialization on 32-device slices. When multi-host DP is active, we protect
        these environment variables from being overwritten.
+    3. Patch RPA block sizes to avoid TPU physical VMEM overflow (64 MB).
     """
+    patch_vllm_tpu_rpa_vmem()
+
     try:
         from vllm.v1.executor.ray_executor_v2 import RayWorkerProc
 
@@ -170,6 +248,7 @@ def patch_vllm_tpu_multihost_dp():
 
             def patched_initialize_worker(self, *args, **kwargs):
                 patch_vllm_tpu_multihost_dp()
+                patch_vllm_tpu_rpa_vmem()
                 return orig_initialize_worker(self, *args, **kwargs)
 
             RayWorkerProc.initialize_worker = patched_initialize_worker
@@ -252,16 +331,24 @@ def patch_vllm_tpu_multihost_dp():
                 if is_multihost_dp:
                     dp_rank = self.parallel_config.data_parallel_index or 0
                     tp_size = self.parallel_config.tensor_parallel_size or 8
-                    dp_size = int(os.environ.get("TORCH_TPU_DP_SIZE", "0")) or (len(addrs) // tp_size if addrs else 1) or 1
+                    dp_size = (
+                        int(os.environ.get("TORCH_TPU_DP_SIZE", "0")) or (len(addrs) // tp_size if addrs else 1) or 1
+                    )
 
                     slice_local_rank = int(os.environ.get("TORCH_TPU_SLICE_LOCAL_RANK", str(self.local_rank)))
                     slice_rank = int(os.environ.get("TORCH_TPU_SLICE_RANK", str(dp_rank * tp_size + slice_local_rank)))
-                    slice_world_size = int(os.environ.get("TORCH_TPU_SLICE_WORLD_SIZE", str(len(addrs) or (dp_size * tp_size))))
+                    slice_world_size = int(
+                        os.environ.get("TORCH_TPU_SLICE_WORLD_SIZE", str(len(addrs) or (dp_size * tp_size)))
+                    )
                     slice_local_world = int(os.environ.get("TORCH_TPU_SLICE_LOCAL_WORLD_SIZE", str(tp_size)))
 
                     topology = os.environ.get("TORCH_TPU_TOPOLOGY", "")
                     if not topology:
-                        topology = "2,2,4,2" if slice_world_size == 32 else ("2,2,1,2" if slice_world_size == 8 else f"1,1,1,{slice_world_size}")
+                        topology = (
+                            "2,2,4,2"
+                            if slice_world_size == 32
+                            else ("2,2,1,2" if slice_world_size == 8 else f"1,1,1,{slice_world_size}")
+                        )
 
                     master_addr = (
                         os.environ.get("TORCH_TPU_DP_MASTER_ADDR")
@@ -309,11 +396,18 @@ def patch_vllm_tpu_multihost_dp():
                     print(msg, flush=True)
                     logger.info("%s", msg)
 
+                    self.slice_rank = int(slice_rank)
+                    self.slice_local_rank = int(slice_local_rank)
+                    self.slice_world_size = int(slice_world_size)
+
                     protected_env = {
                         "RANK": str(slice_rank),
                         "LOCAL_RANK": str(slice_local_rank),
                         "WORLD_SIZE": str(slice_world_size),
                         "LOCAL_WORLD_SIZE": str(slice_local_world),
+                        "TORCH_TPU_SLICE_RANK": str(slice_rank),
+                        "TORCH_TPU_SLICE_LOCAL_RANK": str(slice_local_rank),
+                        "TORCH_TPU_SLICE_WORLD_SIZE": str(slice_world_size),
                         "MASTER_ADDR": str(master_addr),
                         "MASTER_PORT": str(master_port),
                         "TORCH_TPU_SLICEBUILDER_ADDRESSES": sb_addresses,
@@ -351,17 +445,86 @@ def patch_vllm_tpu_multihost_dp():
                             orig_init_device.__globals__["get_tpu_worker_binding"] = orig_globals_binding_fn
                 else:
                     orig_init_device(self)
+                try:
+                    patch_vllm_tpu_rpa_vmem()
+                except Exception:
+                    pass
 
             tw.TPUWorker.init_device = patched_init_device
             tw.TPUWorker._verl_multihost_patched = True
             logger.info("Patched vllm_torchtpu.worker.tpu_worker.TPUWorker.init_device for multi-host DP")
+
+            if hasattr(tw.TPUWorker, "load_model") and not getattr(tw.TPUWorker, "_verl_rpa_load_model_patched", False):
+                orig_load_model = tw.TPUWorker.load_model
+
+                def patched_load_model(self, *args, **kwargs):
+                    try:
+                        patch_vllm_tpu_rpa_vmem()
+                    except Exception:
+                        pass
+                    return orig_load_model(self, *args, **kwargs)
+
+                tw.TPUWorker.load_model = patched_load_model
+                tw.TPUWorker._verl_rpa_load_model_patched = True
     except Exception as exc:
-        logger.debug("Could not patch TPUWorker.init_device: %s", exc)
+        logger.debug("Could not patch TPUWorker: %s", exc)
+
+    try:
+        from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
+
+        if hasattr(TpuPlatform, "_get_tpu_topology") and not getattr(TpuPlatform, "_verl_topo_patched", False):
+            orig_get_topo = TpuPlatform._get_tpu_topology
+
+            @classmethod
+            def patched_get_tpu_topology(cls, world_size: int) -> str:
+                if world_size <= 1:
+                    return os.environ.get("TORCH_TPU_TOPOLOGY", "1,1,1,1")
+                try:
+                    return orig_get_topo(world_size)
+                except Exception as e:
+                    if "No TPU topology found" in str(e):
+                        return os.environ.get(
+                            "TORCH_TPU_TOPOLOGY", "1,1,1,1" if world_size <= 1 else f"1,1,1,{world_size}"
+                        )
+                    raise
+
+            TpuPlatform._get_tpu_topology = patched_get_tpu_topology
+            TpuPlatform._verl_topo_patched = True
+            logger.info("Patched vllm_torchtpu.platforms.tpu_platform.TpuPlatform._get_tpu_topology for TP=1")
+    except Exception as exc:
+        logger.debug("Could not patch TpuPlatform._get_tpu_topology: %s", exc)
+
+    try:
+        import torch_tpu._internal.utils.hardware as tpu_hw
+
+        if hasattr(tpu_hw, "get_tpu_topology") and not getattr(tpu_hw, "_verl_topo_patched", False):
+            orig_hw_get_topo = tpu_hw.get_tpu_topology
+
+            def patched_hw_get_tpu_topology(world_size: int | None = None) -> str | None:
+                if world_size is not None and world_size <= 1:
+                    return os.environ.get("TORCH_TPU_TOPOLOGY", "1,1,1,1")
+                try:
+                    return orig_hw_get_topo(world_size)
+                except Exception as e:
+                    if "No TPU topology found" in str(e):
+                        return os.environ.get(
+                            "TORCH_TPU_TOPOLOGY",
+                            "1,1,1,1" if world_size is None or world_size <= 1 else f"1,1,1,{world_size}",
+                        )
+                    raise
+
+            tpu_hw.get_tpu_topology = patched_hw_get_tpu_topology
+            tpu_hw._verl_topo_patched = True
+            logger.info("Patched torch_tpu._internal.utils.hardware.get_tpu_topology for TP=1")
+    except Exception as exc:
+        logger.debug("Could not patch hardware.get_tpu_topology: %s", exc)
 
     try:
         import vllm_torchtpu.executors.ray_distributed_executor_v2 as rdev2
 
-        if hasattr(rdev2, "RayDistributedExecutorV2") and not getattr(rdev2.RayDistributedExecutorV2, "_verl_geom_patched", False):
+        if hasattr(rdev2, "RayDistributedExecutorV2") and not getattr(
+            rdev2.RayDistributedExecutorV2, "_verl_geom_patched", False
+        ):
             orig_geom = rdev2.RayDistributedExecutorV2._get_dp_geometry
 
             def patched_geom(self):
@@ -380,7 +543,9 @@ def patch_vllm_tpu_multihost_dp():
             rdev2.RayDistributedExecutorV2._verl_geom_patched = True
             logger.info("Patched RayDistributedExecutorV2._get_dp_geometry for multi-host DP")
 
-        if hasattr(rdev2, "RayDistributedExecutorV2") and not getattr(rdev2.RayDistributedExecutorV2, "_verl_layout_patched", False):
+        if hasattr(rdev2, "RayDistributedExecutorV2") and not getattr(
+            rdev2.RayDistributedExecutorV2, "_verl_layout_patched", False
+        ):
             orig_layout = rdev2.RayDistributedExecutorV2._slice_host_layout
 
             def patched_layout(self, device_str: str):
@@ -528,6 +693,8 @@ class vLLMColocateWorkerExtension:
         sender_ip: str = None,
         sender_ips: list[str] = None,
         base_port: int = 28000,
+        sender_local_world_size: Optional[int] = None,
+        **kwargs,
     ):
         """Update the weights of the rollout model."""
         from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import BucketedWeightReceiver
@@ -586,30 +753,67 @@ class vLLMColocateWorkerExtension:
         if use_socket:
             vllm_config = getattr(self.model_runner, "vllm_config", None)
             parallel_config = getattr(vllm_config, "parallel_config", None)
-            local_rank = _resolve_vllm_weight_sync_local_rank(
-                getattr(self, "local_rank", getattr(self, "rank", 0)), parallel_config
-            )
-            if sender_ips:
-                dp_rank = None
-                if os.environ.get("TORCH_TPU_SLICE_RANK"):
-                    tp_size = getattr(parallel_config, "tensor_parallel_size", 8) if parallel_config else 8
-                    dp_rank = int(os.environ["TORCH_TPU_SLICE_RANK"]) // tp_size
-                elif parallel_config is not None:
-                    dp_rank = getattr(parallel_config, "data_parallel_index", None)
-                    if dp_rank is None:
-                        dp_rank = getattr(parallel_config, "data_parallel_rank", None)
-                if dp_rank is None:
-                    rank = getattr(self, "rank", None)
-                    tp_size = getattr(parallel_config, "tensor_parallel_size", 8) if parallel_config else 8
-                    if rank is not None and tp_size:
-                        dp_rank = rank // tp_size
-                if dp_rank is None:
-                    dp_rank = int(os.environ.get("NODE_RANK", os.environ.get("TPU_WORKER_ID", "0")))
-                node_rank = int(dp_rank)
-                target_ip = sender_ips[node_rank % len(sender_ips)]
+
+            # Determine this worker's global rank in the rollout slice
+            global_rank = getattr(self, "slice_rank", None)
+            if global_rank is None and os.environ.get("TORCH_TPU_SLICE_RANK"):
+                try:
+                    global_rank = int(os.environ["TORCH_TPU_SLICE_RANK"])
+                except ValueError:
+                    pass
+            if global_rank is None and os.environ.get("CLOUD_TPU_TASK_ID"):
+                try:
+                    global_rank = int(os.environ["CLOUD_TPU_TASK_ID"])
+                except ValueError:
+                    pass
+            if global_rank is None:
+                dp_rank = getattr(parallel_config, "data_parallel_index", None)
+                if dp_rank is None and parallel_config is not None:
+                    dp_rank = getattr(parallel_config, "data_parallel_rank", None)
+                tp_size = getattr(parallel_config, "tensor_parallel_size", 1) if parallel_config else 1
+                worker_local_rank = getattr(self, "local_rank", getattr(self, "rank", 0)) or 0
+                tp_rank = int(worker_local_rank) % tp_size
+                if dp_rank is not None:
+                    global_rank = int(dp_rank) * tp_size + tp_rank
+                else:
+                    global_rank = int(os.environ.get("RANK", getattr(self, "rank", 0) or 0))
+
+            num_hosts = len(sender_ips) if sender_ips else 1
+            if sender_local_world_size is not None:
+                devices_per_host = int(sender_local_world_size)
             else:
-                target_ip = sender_ip
-            zmq_handle = f"tcp://{target_ip}:{base_port + local_rank}"
+                world_size = getattr(self, "slice_world_size", None)
+                if world_size is None and parallel_config is not None:
+                    dp_size = getattr(parallel_config, "data_parallel_size", 1) or 1
+                    tp_size = getattr(parallel_config, "tensor_parallel_size", 1) or 1
+                    world_size = dp_size * tp_size
+                if world_size is None and os.environ.get("TORCH_TPU_SLICE_WORLD_SIZE"):
+                    try:
+                        world_size = int(os.environ["TORCH_TPU_SLICE_WORLD_SIZE"])
+                    except ValueError:
+                        pass
+                if world_size is None:
+                    world_size = int(os.environ.get("WORLD_SIZE", "32"))
+                devices_per_host = max(1, world_size // num_hosts)
+
+            target_host_idx = (global_rank // devices_per_host) % num_hosts
+            target_local_rank = global_rank % devices_per_host
+
+            if sender_ips:
+                target_ip = sender_ips[target_host_idx]
+            else:
+                target_ip = sender_ip or "127.0.0.1"
+
+            zmq_handle = f"tcp://{target_ip}:{base_port + target_local_rank}"
+            logger.info(
+                "[update_weights_from_ipc] global_rank=%s, devices_per_host=%s, target_host_idx=%s, target_ip=%s, port=%s, zmq_handle=%s",
+                global_rank,
+                devices_per_host,
+                target_host_idx,
+                target_ip,
+                base_port + target_local_rank,
+                zmq_handle,
+            )
         else:
             zmq_handle = self._get_zmq_handle()
 
