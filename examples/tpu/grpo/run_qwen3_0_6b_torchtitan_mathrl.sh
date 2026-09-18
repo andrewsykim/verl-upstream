@@ -39,15 +39,19 @@ export VLLM_RAY_EXTRA_ENV_VAR_PREFIXES_TO_COPY=${VLLM_RAY_EXTRA_ENV_VAR_PREFIXES
 export PYTHONUNBUFFERED=1
 export TPU_SKIP_MDS_QUERY=true
 export TPU_ACCELERATOR_TYPE=${TPU_ACCELERATOR_TYPE:-tpu7x}
-export TORCH_TPU_DP_SIZE=${TORCH_TPU_DP_SIZE:-4}
 
 # Deep transformer stacks blow the default limit while AOT-tracing on TPU.
 export TORCH_DYNAMO_RECOMPILE_LIMIT=${TORCH_DYNAMO_RECOMPILE_LIMIT:-100}
 
-# --- Topology -----------------------------------------------------------------
+# --- Topology & Parallelism ---------------------------------------------------
 # PJRT devices per host, NOT chips: a v7x chip exposes two chiplets.
+# 2x2x4 TPU7x slice = 16 chips = 32 PJRT devices across 4 hosts (8 devices/host).
 NUM_TPU=${NUM_TPU:-8}
 NNODES=${NNODES:-4}
+TP_SIZE=${TP_SIZE:-1}
+FSDP_SIZE=${FSDP_SIZE:-$((NUM_TPU * NNODES))}
+EP_SIZE=${EP_SIZE:-1}
+export TORCH_TPU_DP_SIZE=${TORCH_TPU_DP_SIZE:-$(( FSDP_SIZE / TP_SIZE ))}
 
 # --- Paths (site-specific / cluster mounts) -----------------------------------
 DATA_DIR=${DATA_DIR:-/data/jialei/data/openmathinstruct2}
@@ -63,7 +67,8 @@ if [ "${SKIP_DATA_CHECK:-0}" != "1" ]; then
     fi
   done
 fi
-VAL_FILES=${VAL_FILES:-"['${VAL_FILE}','${GSM8K_TEST_FILE}']"}
+# VAL_FILES=${VAL_FILES:-"['${VAL_FILE}','${GSM8K_TEST_FILE}']"}
+VAL_FILES=${VAL_FILES:-"['${VAL_FILE}']"}
 
 REWARD_FN_PATH=${REWARD_FN_PATH:-/data/jialei/reward/maxtext_math_reward.py}
 MODEL_PATH=${MODEL_PATH:-/data/jialei/assets/hf/Qwen3-0.6B}
@@ -75,7 +80,7 @@ TB_MIRROR_ROOT=${TB_MIRROR_ROOT:-/workspace/meta-RL/.home/tensorboard_log}
 mkdir -p "${LOG_DIR}" "${CKPT_DIR}" "${TB_ROOT}"
 
 # --- Scale & Training Knobs ---------------------------------------------------
-TOTAL_STEPS=${TOTAL_STEPS:-20}
+TOTAL_STEPS=${TOTAL_STEPS:-2}
 TEST_FREQ=${TEST_FREQ:-10}
 SAVE_FREQ=${SAVE_FREQ:-50}
 SEED=${SEED:-1}
@@ -175,11 +180,7 @@ on_exit() {
 trap on_exit EXIT
 
 # --- torchtitan Parallelism & Engine Setup ------------------------------------
-# Pure FSDP2 across the slice. TP would need the TPU mesh to match the physical
-# 2x2x1 torus, so leave it at 1 until that is validated.
-FSDP_SIZE=${FSDP_SIZE:-$((NUM_TPU * NNODES))}
-TP_SIZE=${TP_SIZE:-1}
-EP_SIZE=${EP_SIZE:-1}
+# Pure FSDP2 across the slice with TP=1 and maximum DP (${FSDP_SIZE} shards).
 
 # TPU only has "sdpa": flex/flex_flash need FlexAttention's Triton/CUDA kernels and
 # varlen needs FlashAttention, neither of which has a TPU backend.
@@ -204,7 +205,7 @@ clip_ratio_high=0.28
 temperature=${ROLLOUT_TEMPERATURE:-0.8}
 top_p=${ROLLOUT_TOP_P:-0.95}
 top_k=${ROLLOUT_TOP_K:-50}
-max_num_batched_tokens=${MAX_NUM_BATCHED_TOKENS:-32768}
+max_num_batched_tokens=${MAX_NUM_BATCHED_TOKENS:-8192}
 actor_lr=${ACTOR_LR:-1e-6}
 filter_overlong_prompts=${FILTER_OVERLONG_PROMPTS:-False}
 
@@ -270,8 +271,8 @@ common_params=(
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu="${MICRO_BATCH_SIZE_PER_GPU}"
     actor_rollout_ref.rollout.name=vllm_tpu
     actor_rollout_ref.rollout.mode=async
-    actor_rollout_ref.rollout.tensor_model_parallel_size="${NUM_TPU}"
-    actor_rollout_ref.rollout.data_parallel_size="${NNODES}"
+    actor_rollout_ref.rollout.tensor_model_parallel_size="${TP_SIZE}"
+    actor_rollout_ref.rollout.data_parallel_size="${FSDP_SIZE}"
     actor_rollout_ref.rollout.max_model_len="${MAX_MODEL_LEN}"
     actor_rollout_ref.rollout.n="${rollout_n}"
     actor_rollout_ref.rollout.n_gpus_per_node="${NUM_TPU}"
@@ -296,7 +297,7 @@ common_params=(
     trainer.save_freq="${SAVE_FREQ}"
     trainer.default_local_dir="${CKPT_DIR}/${EXPERIMENT_NAME}"
     trainer.test_freq="${TEST_FREQ}"
-    trainer.val_before_train="${VAL_BEFORE_TRAIN:-True}"
+    trainer.val_before_train="${VAL_BEFORE_TRAIN:-False}"
     trainer.log_val_generations=10
     trainer.validation_data_dir="${VAL_DUMP_DIR}"
     trainer.rollout_data_dir="${ROLLOUT_DUMP_DIR}"
@@ -319,6 +320,8 @@ common_params=(
 
 if [ "${USE_CUSTOM_REWARD:-1}" = "1" ] && [ -n "${REWARD_FN_PATH:-}" ]; then
   common_params+=(
+    reward.custom_reward_function.path="${REWARD_FN_PATH}"
+    reward.custom_reward_function.name=compute_score
     custom_reward_function.path="${REWARD_FN_PATH}"
     custom_reward_function.name=compute_score
   )
