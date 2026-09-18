@@ -173,6 +173,10 @@ def main(config):
     # Automatically set `config.trainer.device = npu` when running on Ascend NPU.
     auto_set_device(config)
 
+    from verl.experimental.reward_loop import migrate_legacy_reward_impl
+
+    config = migrate_legacy_reward_impl(config)
+
     # validate config
     validate_config(
         config=config,
