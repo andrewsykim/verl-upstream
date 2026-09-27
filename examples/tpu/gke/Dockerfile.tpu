@@ -1,52 +1,45 @@
-# Use the latest Ray master as base.
+# Use Ray 2.56.0 Python 3.12 as base.
 FROM rayproject/ray:2.56.0-py312
 
-RUN sudo apt-get update && sudo apt-get install -y libopenblas-base libopenmpi-dev libomp-dev
-RUN pip uninstall -y torch torchvision
+RUN sudo apt-get update && sudo apt-get install -y \
+    gcc-12 \
+    g++-12 \
+    build-essential \
+    cmake \
+    ninja-build \
+    libgoogle-perftools4 \
+    libopenblas-base \
+    libopenmpi-dev \
+    libomp-dev \
+    && sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-12 100 --slave /usr/bin/g++ g++ /usr/bin/g++-12 \
+    && sudo rm -rf /var/lib/apt/lists/*
 
-RUN pip install keyrings.google-artifactregistry-auth
-RUN pip install pandas==2.3.3
+RUN pip uninstall -y torch torchvision || true
+RUN pip install --upgrade pip uv keyrings.google-artifactregistry-auth pandas==2.3.3
 
 ARG AUTH_TOKEN
-# Keep PyPI as primary index and point PIP_EXTRA_INDEX_URL to the Torch TPU virtual registry
-ENV PIP_INDEX_URL="https://pypi.org/simple"
+# Use PIP_EXTRA_INDEX_URL so PyPI remains the primary index for standard packages like JAX
 ENV PIP_EXTRA_INDEX_URL="https://oauth2accesstoken:${AUTH_TOKEN}@us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/"
 
-# --- Add torchtitan setup from Dockerfile ---
+# --- Add torchtitan & torch_tpu setup ---
 USER root
 WORKDIR /
 
 RUN pip install "jax[tpu]==0.10.2" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
 RUN pip install "tokamax==0.0.14"
-RUN pip install torch==2.12.0 --index-url https://download.pytorch.org/whl/cpu
-RUN pip install torchvision==0.27.0 --index-url https://download.pytorch.org/whl/cpu
+RUN pip install torch==2.13.0 --index-url https://download.pytorch.org/whl/cpu
+RUN pip install torchvision==0.28.0 --index-url https://download.pytorch.org/whl/cpu
 RUN pip install libtpu==0.0.47 -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
 
-# Pinned to dev20260912075415 to match the Raiden tpu_sync C++ TensorBufferHandle symbols
 RUN pip install --pre --no-deps \
-    --extra-index-url "https://oauth2accesstoken:${AUTH_TOKEN}@us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/" \
-    torch-tpu==0.1.1.dev20260912075415
+    "torch-tpu==0.1.1.dev20260912075415" \
+    "tpu-sync-torch==0.0.1.dev20260922174834" \
+    --index-url "https://oauth2accesstoken:${AUTH_TOKEN}@us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/"
 
 RUN pip install 'typeguard==2.13.3'
 RUN pip install portpicker absl-py numpy gcsfs frozendict triton fairscale tamm "spmd_types==0.2.1" "tyro>=1.0.5"
 
-# Install TPU Raiden / TPU Sync wheel from tpu-pytorch Artifact Registry
-RUN for PY in /home/ray/anaconda3/bin/python3 /usr/bin/python3; do \
-      if [ -x "$PY" ]; then \
-        $PY -m pip install --no-cache-dir --no-deps --force-reinstall \
-          --extra-index-url "https://oauth2accesstoken:${AUTH_TOKEN}@us-python.pkg.dev/tpu-pytorch/torch-xla/simple/" \
-          "tpu-sync-torch==0.0.1.dev20260918055440+torch2120" && \
-        SITE_DIR=$($PY -c "import site; print(site.getsitepackages()[0])") && \
-        echo "${SITE_DIR}/torch_tpu/csrc/common/glue_2_12_0" > /etc/ld.so.conf.d/torch_tpu.conf && \
-        echo "${SITE_DIR}/torch_tpu/csrc/common" >> /etc/ld.so.conf.d/torch_tpu.conf && \
-        echo "${SITE_DIR}/torch_tpu" >> /etc/ld.so.conf.d/torch_tpu.conf && \
-        echo "${SITE_DIR}/torch/lib" >> /etc/ld.so.conf.d/torch_tpu.conf && \
-        echo "${SITE_DIR}/tpu_sync/frameworks/torch" >> /etc/ld.so.conf.d/torch_tpu.conf; \
-      fi; \
-    done && \
-    ldconfig
-
-# --- Install torchtitan, vllm and torchtpu-vllm ---
+# --- Install torchtitan (latest main @ f880cc73725de77d892ecab888244e7718e5ad65) ---
 ARG GITHUB_USER
 ARG GITHUB_TOKEN
 RUN git clone https://${GITHUB_USER}:${GITHUB_TOKEN}@github.com/google-pytorch/torchtitan.git /torchtitan
@@ -99,20 +92,28 @@ RUN pip install --no-cache-dir \
     tensorboard \
     TransferQueue==0.1.8
 
-# Re-verify and lock exact JAX / libtpu / Transformers versions after all dependency resolvers run
-RUN pip install --no-deps \
+# Re-verify and lock exact PyTorch / TorchTPU / JAX / libtpu / Transformers versions after all dependency resolvers run
+RUN pip install --no-deps torch==2.13.0 torchvision==0.28.0 --index-url https://download.pytorch.org/whl/cpu && \
+    pip install --pre --no-deps \
+    "torch-tpu==0.1.1.dev20260912075415" \
+    "tpu-sync-torch==0.0.1.dev20260922174834" \
+    --index-url "https://oauth2accesstoken:${AUTH_TOKEN}@us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/" && \
+    pip install --no-deps \
     "jax==0.10.2" \
     "jaxlib==0.10.2" \
     "libtpu==0.0.47" \
     "numba==0.65.0" \
     "transformers>=5.10.4,<5.11" \
     "fastapi<0.137" \
-    -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+    -f https://storage.googleapis.com/jax-releases/libtpu_releases.html && \
+    ln -sf /home/ray/anaconda3/lib/python3.12/site-packages/torch_tpu/csrc/common/glue_2_13_0/libpywrap_2_13_0_common.so \
+           /home/ray/anaconda3/lib/python3.12/site-packages/torch_tpu/csrc/common/libpywrap_torch_tpu_common.so
 
 WORKDIR /app
 
 ENV PIP_EXTRA_INDEX_URL=""
 ENV PIP_INDEX_URL=""
+ENV LD_LIBRARY_PATH="/home/ray/anaconda3/lib/python3.12/site-packages/torch_tpu/csrc/common${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 # Add /app, /vllm-torchtpu, and /torchtitan to PYTHONPATH.
 ENV PYTHONPATH="/vllm-torchtpu/src:/vllm-torchtpu:/torchtpu-vllm/src:/torchtpu-vllm:/app:/torchtitan:/torchtitan/torchtitan${PYTHONPATH:+:$PYTHONPATH}"
