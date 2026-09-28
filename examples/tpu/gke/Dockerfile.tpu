@@ -48,14 +48,14 @@ RUN git checkout f880cc73725de77d892ecab888244e7718e5ad65
 RUN pip install -r requirements.txt
 WORKDIR /
 
-# --- Install vLLM v0.29.0 and vllm-project/vllm-torchtpu (latest main @ b669274dcc5e6e1f2d998986fd900f2e4e23092c) ---
+# --- Install vLLM v0.29.0 and vllm-project/vllm-torchtpu (@ 9faafb177ca1f1fca39d404caa5a7fadbfdb9a06, includes #1160 same-step prefix-hit fix) ---
 ENV VLLM_TARGET_DEVICE="tpu"
 RUN git clone --depth 1 --branch v0.29.0 https://github.com/vllm-project/vllm.git /vllm
 RUN git clone https://${GITHUB_USER}:${GITHUB_TOKEN}@github.com/vllm-project/vllm-torchtpu.git /vllm-torchtpu && \
     ln -sfnT /vllm-torchtpu /torchtpu-vllm
 
 WORKDIR /vllm-torchtpu
-RUN git checkout b669274dcc5e6e1f2d998986fd900f2e4e23092c
+RUN git checkout 9faafb177ca1f1fca39d404caa5a7fadbfdb9a06
 WORKDIR /
 
 # Patch vLLM's TPU requirements to avoid pulling upstream tpu-inference (JAX/torchax) over vllm-torchtpu
