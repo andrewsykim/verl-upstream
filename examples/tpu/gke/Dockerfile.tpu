@@ -33,7 +33,7 @@ RUN pip install libtpu==0.0.47 -f https://storage.googleapis.com/jax-releases/li
 
 RUN pip install --pre --no-deps \
     "torch-tpu==0.1.1.dev20260912075415" \
-    "tpu-sync-torch==0.0.1.dev20260922174834" \
+    "tpu-sync-torch==0.0.1.dev20260927082445" \
     --index-url "https://oauth2accesstoken:${AUTH_TOKEN}@us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/"
 
 RUN pip install 'typeguard==2.13.3'
@@ -96,7 +96,7 @@ RUN pip install --no-cache-dir \
 RUN pip install --no-deps torch==2.13.0 torchvision==0.28.0 --index-url https://download.pytorch.org/whl/cpu && \
     pip install --pre --no-deps \
     "torch-tpu==0.1.1.dev20260912075415" \
-    "tpu-sync-torch==0.0.1.dev20260922174834" \
+    "tpu-sync-torch==0.0.1.dev20260927082445" \
     --index-url "https://oauth2accesstoken:${AUTH_TOKEN}@us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/" && \
     pip install --no-deps \
     "jax==0.10.2" \
@@ -105,15 +105,12 @@ RUN pip install --no-deps torch==2.13.0 torchvision==0.28.0 --index-url https://
     "numba==0.65.0" \
     "transformers>=5.10.4,<5.11" \
     "fastapi<0.137" \
-    -f https://storage.googleapis.com/jax-releases/libtpu_releases.html && \
-    ln -sf /home/ray/anaconda3/lib/python3.12/site-packages/torch_tpu/csrc/common/glue_2_13_0/libpywrap_2_13_0_common.so \
-           /home/ray/anaconda3/lib/python3.12/site-packages/torch_tpu/csrc/common/libpywrap_torch_tpu_common.so
+    -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
 
 WORKDIR /app
 
 ENV PIP_EXTRA_INDEX_URL=""
 ENV PIP_INDEX_URL=""
-ENV LD_LIBRARY_PATH="/home/ray/anaconda3/lib/python3.12/site-packages/torch_tpu/csrc/common${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 # Add /app, /vllm-torchtpu, and /torchtitan to PYTHONPATH.
 ENV PYTHONPATH="/vllm-torchtpu/src:/vllm-torchtpu:/torchtpu-vllm/src:/torchtpu-vllm:/app:/torchtitan:/torchtitan/torchtitan${PYTHONPATH:+:$PYTHONPATH}"
