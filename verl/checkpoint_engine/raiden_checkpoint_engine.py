@@ -196,6 +196,8 @@ class RaidenCheckpointEngine(CheckpointEngine):
         self._trainer_raiden_ws = None
         self._trainer_chunks = []
         self._controller_addr = None
+        self._registered_signature = None
+        self._bound_tensors = None
         if torch.distributed.is_initialized():
             self.rank = torch.distributed.get_rank()
         else:
@@ -222,44 +224,11 @@ class RaidenCheckpointEngine(CheckpointEngine):
             except Exception:
                 pass
             self._trainer_raiden_ws = None
+        self._registered_signature = None
+        self._bound_tensors = None
 
-    @torch.no_grad()
-    async def send_weights(
-        self,
-        weights: Generator[tuple[str, torch.Tensor], None, None]
-        | Iterable[tuple[str, torch.Tensor]]
-        | dict[str, torch.Tensor],
-        dst_peers: Optional[list[str]] = None,
-        global_steps: Optional[int] = None,
-        compute_stats: Optional[bool] = None,
-        compute_checksum: Optional[bool] = None,
-        **kwargs,
-    ):
-        """Register weights with RaidenController and prepare for coordinated P2P network transfer."""
-        if compute_stats is None:
-            compute_stats = compute_checksum if compute_checksum is not None else getattr(self, "verify_parity", False)
-        step_key = global_steps if global_steps is not None else 0
-        logger.info(f"RaidenCheckpointEngine: [Step {step_key}] Start send_weights...")
-
-        try:
-            from torch_tpu._internal import sync as torch_tpu_sync
-
-            torch_tpu_sync.synchronize(wait=True)
-        except Exception as e:
-            logger.warning(f"Could not synchronize via torch_tpu: {e}")
-            raise RuntimeError(f"TPU synchronization failed: {e}") from e
-
-        # Materialize weights into dictionary in a single pass and filter tied embeddings
-        weight_dict = dict(filter_tied_embeddings(weights.items() if hasattr(weights, "items") else weights))
-
-        # Trainer sends pure canonical un-fused model weights directly
-        unfused_weights = {k: _unwrap_tensor(v) for k, v in weight_dict.items()}
-
-        sorted_weights = sorted(unfused_weights.items(), key=lambda x: x[0])
-        valid_weights = validate_and_sanitize_tensors(sorted_weights, device=torch.device("tpu"))
-
-        torch_tpu_sync.synchronize(wait=True)
-
+    async def _create_and_register(self, valid_weights: list[tuple[str, torch.Tensor]]) -> None:
+        """(Re)create the trainer WeightSynchronizer on ``valid_weights`` and register it with the controller."""
         if self._trainer_raiden_ws is not None:
             try:
                 self._trainer_raiden_ws.close()
@@ -354,15 +323,62 @@ class RaidenCheckpointEngine(CheckpointEngine):
                 f"Trainer Rank {self.rank}: No RaidenController address found in TPUWeightRegistry after timeout"
             )
 
-        # Stage weights to host buffer via D2H DMA
-        t_d2h_start = time.perf_counter()
-        self._trainer_raiden_ws.d2h()
-        t_d2h = time.perf_counter() - t_d2h_start
-        print(
-            f"[RAIDEN TELEMETRY | Trainer Worker] Trainer Rank {self.rank}: D2H DMA transfer completed in {t_d2h:.4f}s",
-            flush=True,
-        )
-        logger.info(f"Trainer Rank {self.rank}: D2H DMA transfer completed in {t_d2h:.4f}s")
+    @torch.no_grad()
+    async def send_weights(
+        self,
+        weights: Generator[tuple[str, torch.Tensor], None, None]
+        | Iterable[tuple[str, torch.Tensor]]
+        | dict[str, torch.Tensor],
+        dst_peers: Optional[list[str]] = None,
+        global_steps: Optional[int] = None,
+        compute_stats: Optional[bool] = None,
+        compute_checksum: Optional[bool] = None,
+        **kwargs,
+    ):
+        """Register weights with RaidenController and prepare for coordinated P2P network transfer."""
+        if compute_stats is None:
+            compute_stats = compute_checksum if compute_checksum is not None else getattr(self, "verify_parity", False)
+        step_key = global_steps if global_steps is not None else 0
+        logger.info(f"RaidenCheckpointEngine: [Step {step_key}] Start send_weights...")
+
+        try:
+            from torch_tpu._internal import sync as torch_tpu_sync
+
+            torch_tpu_sync.synchronize(wait=True)
+        except Exception as e:
+            logger.warning(f"Could not synchronize via torch_tpu: {e}")
+            raise RuntimeError(f"TPU synchronization failed: {e}") from e
+
+        # Materialize weights into dictionary in a single pass and filter tied embeddings
+        weight_dict = dict(filter_tied_embeddings(weights.items() if hasattr(weights, "items") else weights))
+
+        # Trainer sends pure canonical un-fused model weights directly
+        unfused_weights = {k: _unwrap_tensor(v) for k, v in weight_dict.items()}
+
+        sorted_weights = sorted(unfused_weights.items(), key=lambda x: x[0])
+        valid_weights = validate_and_sanitize_tensors(sorted_weights, device=torch.device("tpu"))
+
+        torch_tpu_sync.synchronize(wait=True)
+
+        # Reuse the WeightSynchronizer across steps when the tensor signature is unchanged: rebinding keeps
+        # the DMA-mapped host buffers, listener/threads, and controller registration, and only swaps the
+        # device buffers the D2H reads from. Rebuilding every step re-allocates, pins, and first-touches
+        # a model-sized host buffer per rank (~1s/step at 0.6B). Rebuild only on first use or if the
+        # (name, shape, dtype) signature changes.
+        signature = [(name, tuple(t.shape), t.dtype) for name, t in valid_weights]
+        if self._trainer_raiden_ws is not None and signature == self._registered_signature:
+            self._trainer_raiden_ws.bind_weights([[t] for _, t in valid_weights])
+        else:
+            await self._create_and_register(valid_weights)
+            self._registered_signature = signature
+        # Keep the bound device buffers alive until the next sync: the controller-driven push reads them
+        # after send_weights returns.
+        self._bound_tensors = [t for _, t in valid_weights]
+
+        # No explicit ws.d2h() here: PushWeightsResharded (triggered by the controller's start_transfer)
+        # performs a pipelined D2H overlapped with H2H, using the per-transfer skip_tiling plan. An
+        # explicit d2h() before the first transfer has no skip_tiling plan yet and stages the wrong
+        # (detiled) layout; it was only ever masked by the push's own D2H.
 
         # Compute deterministic stats & norms across all sent tensors directly on main thread (Rank 0 only)
         if compute_stats and self.registry is not None and self.is_master:
