@@ -78,13 +78,16 @@ MODEL_PATH="${MODEL_PATH:-${RAY_DATA_HOME}/assets/hf/Qwen3-0.6B}"
 TRAIN_FILE="${RAY_DATA_HOME}/data/gsm8k/train.parquet"
 TEST_FILE="${RAY_DATA_HOME}/data/gsm8k/test.parquet"
 
-# TPU 2-slice v6e-8 configurations
-export NNODES_TRAINER=2       # 2 physical VM hosts for training slice
-export N_CHIPS_TRAINER=4      # 4 TPU chips per training host
+# TPU topology. Defaults target 2 x v6e-8 slices (trainer on slice 0, rollout on slice 1);
+# override e.g. NNODES_TRAINER=1 N_CHIPS_TRAINER=4 NNODES_ROLLOUT=1 N_CHIPS_ROLLOUT=4 to run
+# on 2 x v6e-4 single-host slices (as the TPU CI does).
+export NNODES_TRAINER="${NNODES_TRAINER:-2}"      # physical VM hosts for the training slice
+export N_CHIPS_TRAINER="${N_CHIPS_TRAINER:-4}"    # TPU chips per training host
 
-export NNODES_ROLLOUT=2       # 2 physical VM hosts for rollout slice
-export N_CHIPS_ROLLOUT=4      # 4 TPU chips per rollout host
+export NNODES_ROLLOUT="${NNODES_ROLLOUT:-2}"      # physical VM hosts for the rollout slice
+export N_CHIPS_ROLLOUT="${N_CHIPS_ROLLOUT:-4}"    # TPU chips per rollout host
 
+TOTAL_TRAINER_CHIPS=$((NNODES_TRAINER * N_CHIPS_TRAINER))
 TOTAL_ROLLOUT_CHIPS=$((NNODES_ROLLOUT * N_CHIPS_ROLLOUT))
 
 # Sequence budget. max_model_len must cover prompt + response, otherwise vLLM
@@ -95,7 +98,7 @@ MAX_MODEL_LEN=$((MAX_PROMPT_LEN + MAX_RESPONSE_LEN))
 # Actor parallelism. Pure FSDP is the only configuration that has been validated
 # on TPU; see the note at the top of this file before changing these.
 TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-1}"
-DATA_PARALLEL_SHARD_SIZE="${DATA_PARALLEL_SHARD_SIZE:-8}"
+DATA_PARALLEL_SHARD_SIZE="${DATA_PARALLEL_SHARD_SIZE:-${TOTAL_TRAINER_CHIPS}}"
 
 if [[ "${TENSOR_PARALLEL_SIZE}" != "1" ]]; then
     set +x

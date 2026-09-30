@@ -18,7 +18,12 @@ metadata:
   labels:
     app: github-tpu-ci-runner
 spec:
-  replicas: 1
+  # Two workflow runs' worth of tier jobs (v6e 1-chip / 4-chip / 8-chip) can hold a runner at
+  # once. A runner stays busy while its job waits in Kueue, so a few spares keep e.g. a 1-chip job
+  # from waiting for a runner behind queued 8-chip jobs. Runners only submit work; TPU contention
+  # is resolved by the per-tier Kueue LocalQueues `verl-tpu-ci-{1chip,4chip,8chip}` (see
+  # tests/special_tpu/gke/kueue-tpu-ci.yaml).
+  replicas: 6
   selector:
     matchLabels:
       app: github-tpu-ci-runner
@@ -26,6 +31,10 @@ spec:
     metadata:
       labels:
         app: github-tpu-ci-runner
+      annotations:
+        # The default-pool autoscaler would otherwise drain an under-used node and kill a
+        # runner mid-job ("The runner has received a shutdown signal").
+        cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
     spec:
       serviceAccountName: ray-ksa
       containers:
@@ -36,8 +45,11 @@ spec:
               value: "https://github.com/verl-project/verl"
             - name: RUNNER_SCOPE
               value: "repo"
-            - name: RUNNER_NAME
+            # Unique runner name per replica: <prefix>-<random suffix>.
+            - name: RUNNER_NAME_PREFIX
               value: "gke-jialeic-ci-v6e8-2s-spot"
+            - name: RANDOM_RUNNER_SUFFIX
+              value: "true"
             - name: LABELS
               value: "self-hosted,linux,x64,tpu,tpu-v6e8-2s"
             - name: EPHEMERAL
@@ -48,9 +60,10 @@ spec:
                   name: github-runner-secret
                   key: ACCESS_TOKEN
           resources:
+            # Runners only run kubectl / the Ray job CLI; keep requests small so 6 fit on default-pool.
             requests:
-              cpu: "4"
-              memory: "16Gi"
+              cpu: "2"
+              memory: "8Gi"
             limits:
               cpu: "8"
               memory: "32Gi"

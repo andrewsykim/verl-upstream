@@ -1,4 +1,4 @@
-# End-to-End TPU CI Workflow (SFT & GRPO on GKE Cloud TPU v6e-8 x2 Slices)
+# End-to-End TPU CI Workflow (GKE Cloud TPU v6e, Qwen3-0.6B)
 #
 # Target GKE Cluster:
 #   export CLUSTER_NAME="jialeic-ci-v6e8-2s-spot"
@@ -6,23 +6,37 @@
 #   export PROJECT="tpu-pytorch"
 #   gcloud container clusters get-credentials $CLUSTER_NAME --region $REGION --project $PROJECT --dns-endpoint
 #
-# Mirrors `.github/workflows/e2e_sft_llm.yml` and `.github/workflows/e2e_v1_separate_async.yml`
-# for Google Cloud TPU v6e (TorchTitan FSDP2 SFT + V1 Separate Async GRPO with vLLM-TPU).
+# Three independent CI tiers, named by TPU chip count. Each runs as its own job with its own
+# short-lived RayCluster; add new tests to the matching tier in tests/special_tpu/run_tpu_e2e_ci.sh.
+#   v6e 1-chip - TPU platform tests (whole ct6e-standard-1t node): torch_tpu import / to(device) /
+#                matmul / autograd / TPU-vs-CPU MLP forward+backward.
+#   v6e 4-chip - trainer tests (1 x v6e-4 subslice): GSM8K SFT, TorchTitan FSDP2
+#                (mirrors e2e_sft_llm.yml).
+#   v6e 8-chip - RL tests (2 x v6e-4 subslices): GSM8K GRPO, 4-chip TorchTitan trainer + 4-chip
+#                vLLM rollout, V1 separate-async (mirrors e2e_v1_separate_async.yml).
+# A single v6e host (4 chips) is the smallest multi-chip unit: libtpu cannot open an ICI session
+# on a 2-chip subset of a host. 1 chip comes from a dedicated 1x1 node pool.
+#
+# tests/special_tpu/run_tpu_e2e_ci.sh provisions the tier's RayCluster through the tier's Kueue
+# LocalQueue (`verl-tpu-ci-{1chip,4chip,8chip}`, FIFO per tier), so concurrent jobs queue for TPU
+# quota instead of fighting for hosts, runs the tier's tests, and deletes the cluster on exit. The
+# final `if: always()` step deletes it again in case the job was cancelled.
 
 name: e2e_tpu
 
 on:
   workflow_dispatch:
     inputs:
-      test_suite:
-        description: "TPU E2E suite to execute (all, sft, or grpo)"
+      test_tier:
+        description: "TPU CI tier to execute (all, v6e-1chip, v6e-4chip, or v6e-8chip)"
         required: false
         default: "all"
         type: choice
         options:
           - all
-          - sft
-          - grpo
+          - v6e-1chip
+          - v6e-4chip
+          - v6e-8chip
       smoke_test:
         description: "Run fast CI smoke configuration (SMOKE_TEST=1)"
         required: false
@@ -73,10 +87,9 @@ on:
       - "verl/workers/rollout/vllm_rollout/**"
       - "verl/workers/utils/**"
 
-# Scope concurrency per PR/branch so a new commit on the SAME PR cancels its own stale
-# run, while multiple different PRs (#19, #20, #21...) NEVER cancel each other and
-# instead queue in strict FIFO order on the single GKE runner (`replicas: 1`) and
-# Kubernetes cluster lock (`tpu-ci-cluster-lock`).
+# A new commit on the same PR cancels its own stale run (its RayClusters are torn down by
+# the always() step). Different PRs never cancel each other; their RayClusters wait in the
+# Kueue queue until TPU quota frees up.
 concurrency:
   group: e2e-tpu-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/heads/tpu-main') && github.ref != 'refs/heads/tpu_sft' }}
@@ -89,18 +102,44 @@ env:
   CLUSTER_NAME: "jialeic-ci-v6e8-2s-spot"
   REGION: "us-central2"
   PROJECT: "tpu-pytorch"
-  RAY_CLUSTER_NAME: "ray-tpu-v6e-cluster"
   RAY_NAMESPACE: "default"
+  KUEUE_QUEUE_PREFIX: "verl-tpu-ci"
+  QUEUE_TIMEOUT_MINS: "90"
   SMOKE_TEST: ${{ github.event.inputs.smoke_test || '1' }}
   GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
   GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
   GCP_SERVICE_ACCOUNT: ${{ secrets.GCP_SERVICE_ACCOUNT }}
 
 jobs:
+  select_tiers:
+    name: Select TPU tiers
+    runs-on: ubuntu-latest
+    outputs:
+      tiers: ${{ steps.select.outputs.tiers }}
+    steps:
+      - id: select
+        env:
+          SELECTED: ${{ github.event.inputs.test_tier || 'all' }}
+        run: |
+          all='[{"tier":"v6e-1chip","name":"v6e 1-chip","tests":"TPU platform tests"},
+                {"tier":"v6e-4chip","name":"v6e 4-chip","tests":"trainer tests"},
+                {"tier":"v6e-8chip","name":"v6e 8-chip","tests":"RL tests"}]'
+          if [[ "${SELECTED}" == "all" ]]; then
+            echo "tiers=$(jq -c . <<<"${all}")" >> "${GITHUB_OUTPUT}"
+          else
+            echo "tiers=$(jq -c --arg t "${SELECTED}" '[.[] | select(.tier == $t)]' <<<"${all}")" >> "${GITHUB_OUTPUT}"
+          fi
+
   e2e_tpu:
-    name: E2E TPU v6e SFT & GRPO (Qwen3-0.6B TorchTitan FSDP2 + vLLM V1)
+    name: ${{ matrix.name }} (${{ matrix.tests }})
+    needs: select_tiers
     runs-on: ${{ github.event.inputs.runner_type || vars.TPU_CI_RUNNER || 'self-hosted' }}
-    timeout-minutes: 60
+    # Includes up to QUEUE_TIMEOUT_MINS of waiting in the Kueue queue for TPU quota.
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.select_tiers.outputs.tiers) }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -136,22 +175,9 @@ jobs:
           python3 -m pip install --upgrade pip
           python3 -m pip install --quiet "ray[default]"
 
-      - name: Connect to GKE TPU Cluster
-        run: |
-          if [[ -z "${KUBERNETES_SERVICE_HOST:-}" ]]; then
-            export CLUSTER_NAME="jialeic-ci-v6e8-2s-spot"
-            export REGION="us-central2"
-            export PROJECT="tpu-pytorch"
-            gcloud container clusters get-credentials $CLUSTER_NAME --region $REGION --project $PROJECT --dns-endpoint
-          fi
-          kubectl get nodes -o wide
+      - name: Provision RayCluster, run ${{ matrix.tests }}, tear down
+        run: bash tests/special_tpu/run_tpu_e2e_ci.sh ${{ matrix.tier }}
 
-      - name: Run GSM8K E2E SFT on TPU v6e-8 (TorchTitan FSDP2)
-        if: ${{ (github.event_name != 'workflow_dispatch') || github.event.inputs.test_suite == 'all' || github.event.inputs.test_suite == 'sft' }}
-        run: |
-          bash tests/special_tpu/run_tpu_e2e_ci.sh sft
-
-      - name: Reset KubeRay TPU Pods & Run GSM8K E2E GRPO on TPU v6e-8 x2 Slices
-        if: ${{ (github.event_name != 'workflow_dispatch') || github.event.inputs.test_suite == 'all' || github.event.inputs.test_suite == 'grpo' }}
-        run: |
-          FORCE_POD_RESET=1 bash tests/special_tpu/run_tpu_e2e_ci.sh grpo
+      - name: Tear down RayCluster (safety net for cancelled or crashed runs)
+        if: ${{ always() }}
+        run: bash tests/special_tpu/run_tpu_e2e_ci.sh teardown ${{ matrix.tier }}
