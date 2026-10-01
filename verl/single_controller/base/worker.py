@@ -199,7 +199,7 @@ class Worker(WorkerHelper):
         master_addr = os.environ["MASTER_ADDR"]
         master_port = os.environ["MASTER_PORT"]
 
-        local_world_size = int(os.getenv("LOCAL_WORLD_SIZE", "1"))
+        local_world_size = int(os.getenv("LOCAL_WORLD_SIZE", os.getenv("RAY_LOCAL_WORLD_SIZE", "1")))
         local_rank = int(os.getenv("LOCAL_RANK", "0"))
 
         store = {
@@ -277,7 +277,9 @@ class Worker(WorkerHelper):
             # so we need to set local rank when the flag is set.
             device_name = get_resource_name()
             if device_name == "TPU":
-                local_rank = os.environ.get("TPU_VISIBLE_CHIPS", "0")
+                local_rank = os.environ.get("TPU_VISIBLE_CHIPS", os.environ.get("TPU_VISIBLE_DEVICES", "0"))
+                os.environ["TPU_VISIBLE_CHIPS"] = str(local_rank)
+                os.environ["TPU_VISIBLE_DEVICES"] = str(local_rank)
             else:
                 local_rank = ray.get_runtime_context().get_accelerator_ids()[device_name][0]
 

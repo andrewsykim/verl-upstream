@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# GRPO | Qwen3-0.6B | GSM8K | TorchTitan Training & vLLM Rollout | TPU v6e-8 x2 Slices
+# GRPO | Qwen3-0.6B | GSM8K | TorchTitan Training & vLLM Rollout | TPU 7x (2x2x1 Single-Host) & TPU v6e
 # V1 PPOTrainer (Separate Async Overlap)
 #
 # By default this runs a realistic 100-step GRPO job whose reward curve actually
@@ -31,6 +31,8 @@ set -xeuo pipefail
 
 export RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS=1
 export VERL_PLATFORM=tpu
+# TPU generation: leave TPU_ACCELERATOR_TYPE unset on v6e. On TPU 7x, pass TPU_ACCELERATOR_TYPE=tpu7x
+# (e.g. via --runtime-env-json) to select the 4D topology map; it aborts libtpu on v6e.
 export RAY_OVERRIDE_JOB_RUNTIME_ENV=1
 export VLLM_USE_V1=1
 export RAY_memory_monitor_refresh_ms=0
@@ -72,11 +74,11 @@ fi
 project_name='verl_tpu_grpo'
 
 # Paths
-RAY_DATA_HOME="/data/jialei"
+RAY_DATA_HOME="${RAY_DATA_HOME:-/data/jialei}"
 MODEL_PATH="${MODEL_PATH:-${RAY_DATA_HOME}/assets/hf/Qwen3-0.6B}"
 
-TRAIN_FILE="${RAY_DATA_HOME}/data/gsm8k/train.parquet"
-TEST_FILE="${RAY_DATA_HOME}/data/gsm8k/test.parquet"
+TRAIN_FILE="${TRAIN_FILE:-${RAY_DATA_HOME}/data/gsm8k/train.parquet}"
+TEST_FILE="${TEST_FILE:-${RAY_DATA_HOME}/data/gsm8k/test.parquet}"
 
 # TPU topology. Defaults target 2 x v6e-8 slices (trainer on slice 0, rollout on slice 1);
 # override e.g. NNODES_TRAINER=1 N_CHIPS_TRAINER=4 NNODES_ROLLOUT=1 N_CHIPS_ROLLOUT=4 to run
