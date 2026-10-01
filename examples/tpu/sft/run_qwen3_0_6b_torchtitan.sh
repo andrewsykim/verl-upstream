@@ -33,8 +33,9 @@ TRAIN_FILE="${TRAIN_FILE:-${RAY_DATA_HOME}/data/gsm8k_sft/train.parquet}"
 TEST_FILE="${TEST_FILE:-${RAY_DATA_HOME}/data/gsm8k_sft/test.parquet}"
 
 # TPU Node topology configs (defaults to 1 full v6e-8 slice = 2 hosts x 4 chips).
-# On TPU 7x, pass TPU_ACCELERATOR_TYPE=tpu7x (e.g. via --runtime-env-json) to select the 4D topology
-# map; leave it unset on v6e, where the 7x topology aborts libtpu.
+# TPU_ACCELERATOR_TYPE defaults to v6e (3D topology map); on TPU 7x, pass TPU_ACCELERATOR_TYPE=tpu7x
+# (e.g. via --runtime-env-json) to select the 4D topology map, which aborts libtpu on v6e.
+export TPU_ACCELERATOR_TYPE="${TPU_ACCELERATOR_TYPE:-v6e}"
 export NNODES_TRAINER="${NNODES_TRAINER:-2}"
 export N_CHIPS_TRAINER="${N_CHIPS_TRAINER:-4}"
 TOTAL_TRAINER_CHIPS=$((NNODES_TRAINER * N_CHIPS_TRAINER))

@@ -77,7 +77,7 @@ TPU_V7X_TOPOLOGY_MAP = {
 
 def get_tpu_topology_map() -> dict:
     """Returns the topology map for the configured TPU generation (4D for TPU 7x, 3D otherwise)."""
-    tpu_type = os.environ.get("TPU_ACCELERATOR_TYPE", "").lower()
+    tpu_type = os.environ.get("TPU_ACCELERATOR_TYPE", "v6e").lower()
     return TPU_V7X_TOPOLOGY_MAP if any(k in tpu_type for k in ("tpu7x", "v7x")) else TPU_TOPOLOGY_MAP
 
 
@@ -106,7 +106,7 @@ def get_tpu_chip_hbm_bytes() -> int:
             os.environ.get("TPU_ACCELERATOR_TYPE")
             or os.environ.get("ACCELERATOR_TYPE")
             or os.environ.get("TPU_TYPE")
-            or ""
+            or "v6e"
         ).lower()
 
     for chip_gen, hbm_bytes in TPU_HBM_BYTES_MAP.items():
@@ -160,7 +160,7 @@ class DummyTpuDeviceModule:
         torch.manual_seed(seed)
 
     def get_device_name(self, device: Any = None) -> str:
-        return os.environ.get("TPU_ACCELERATOR_TYPE", "TPU v6e")
+        return os.environ.get("TPU_ACCELERATOR_TYPE", "v6e")
 
 
 class TPUDeviceModuleProxy:
@@ -192,7 +192,7 @@ class TPUDeviceModuleProxy:
         elif name == "reset_peak_memory_stats":
             return lambda *args, **kwargs: None
         elif name == "get_device_name":
-            return lambda *args, **kwargs: os.environ.get("TPU_ACCELERATOR_TYPE", "TPU v6e")
+            return lambda *args, **kwargs: os.environ.get("TPU_ACCELERATOR_TYPE", "v6e")
         elif name == "get_device_properties":
 
             class DummyDeviceProperties:
@@ -472,10 +472,11 @@ class PlatformTPU(PlatformCUDA):
         device_name: str,
     ) -> dict[str, str]:
         """Return platform-specific TPU environment variables for worker nodes."""
-        env_vars = {}
-        for var in ("VERL_PLATFORM", "TPU_ACCELERATOR_TYPE"):
-            if var in os.environ:
-                env_vars[var] = os.environ[var]
+        env_vars = {
+            "TPU_ACCELERATOR_TYPE": os.environ.get("TPU_ACCELERATOR_TYPE", "v6e"),
+        }
+        if "VERL_PLATFORM" in os.environ:
+            env_vars["VERL_PLATFORM"] = os.environ["VERL_PLATFORM"]
         for var in self.ray_noset_envvars():
             env_vars[var] = "1"
         pgs = resource_pool.get_placement_groups(device_name=device_name)
@@ -508,9 +509,10 @@ class PlatformTPU(PlatformCUDA):
 
     def get_ray_init_kwargs(self) -> dict[str, Any]:
         """Return Ray initialization arguments with runtime_env configured for GKE TPU workers."""
-        env_vars = {"VERL_PLATFORM": "tpu"}
-        if "TPU_ACCELERATOR_TYPE" in os.environ:
-            env_vars["TPU_ACCELERATOR_TYPE"] = os.environ["TPU_ACCELERATOR_TYPE"]
+        env_vars = {
+            "VERL_PLATFORM": "tpu",
+            "TPU_ACCELERATOR_TYPE": os.environ.get("TPU_ACCELERATOR_TYPE", "v6e"),
+        }
         return {
             "runtime_env": {
                 "worker_process_setup_hook": patch_ray_worker,
